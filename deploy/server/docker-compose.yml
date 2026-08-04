@@ -3,16 +3,10 @@ services:
     image: hub.osg-htc.org/mwestphall/stomp-server
     build:
       context: ../../stomp-server
-    command: python server.py --port 8080 --replay-window ${REPLAY_WINDOW:-1000}
+    command: python server.py --port 8080
     restart: unless-stopped
     ports:
       - "${SERVER_PORT:-8080}:8080"
-    environment:
-      SERVER_DB: /data/server.sqlite3
-      DROP_EVENT_PERCENT: ${DROP_EVENT_PERCENT:-0}
-      SERVER_RESTART: ${SERVER_RESTART:-0}
-    volumes:
-      - server-data:/data
 
   server-ui:
     image: hub.osg-htc.org/mwestphall/stomp-server-ui
@@ -21,6 +15,3 @@ services:
     restart: unless-stopped
     ports:
       - "${UI_PORT:-8001}:8000"
-
-volumes:
-  server-data:

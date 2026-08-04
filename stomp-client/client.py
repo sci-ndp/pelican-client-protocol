@@ -4,12 +4,10 @@ import argparse
 import asyncio
 import logging
 import os
-import random
 from urllib.parse import urlparse, urlunparse
 
 import websockets
 
-from persistence import ClientPersistence
 from protocol import Frame, parse
 
 
@@ -25,11 +23,7 @@ def websocket_url(value: str) -> str:
 class StompClient:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.state = ClientPersistence(os.getenv("CLIENT_DB", "client.sqlite3"), args.client_id)
         self.log = logging.getLogger("stomp-client")
-        self.events_seen = 0
-        self.drop_ack_percent = float(os.getenv("DROP_ACK_PERCENT", "0"))
-        self.disconnect_after = int(os.getenv("DISCONNECT_AFTER", "0"))
 
     async def run(self) -> None:
         delay = 1
@@ -45,10 +39,10 @@ class StompClient:
 
     async def connected_session(self) -> None:
         async with websockets.connect(websocket_url(self.args.url), ping_interval=None) as ws:
-            await self.send(ws, Frame("CONNECT", {"accept-version": "1.2", "host": "playground", "client-id": self.args.client_id, "heart-beat": f"{self.args.heartbeat},{self.args.heartbeat}"}))
+            await self.send(ws, Frame("CONNECT", {"accept-version": "1.2", "host": "playground", "heart-beat": f"{self.args.heartbeat},{self.args.heartbeat}"}))
             connected = await self.receive(ws)
             if connected.command != "CONNECTED": raise RuntimeError(f"expected CONNECTED, got {connected.command}")
-            await self.send(ws, Frame("SUBSCRIBE", {"id": "sub-0", "destination": self.args.destination, "ack": "client-individual", "last-sequence": str(self.state.last_sequence)}))
+            await self.send(ws, Frame("SUBSCRIBE", {"id": "sub-0", "destination": self.args.destination, "ack": "client-individual"}))
             while True:
                 frame = await self.receive(ws)
                 if frame.command == "MESSAGE": await self.on_message(ws, frame)
@@ -68,22 +62,13 @@ class StompClient:
         return frame
 
     async def on_message(self, ws, frame: Frame) -> None:
-        self.events_seen += 1
-        self.log.info("event sequence=%s destination=%s body=%s", frame.headers.get("sequence"), frame.headers.get("destination"), frame.body)
-        sequence = int(frame.headers["sequence"])
-        if random.random() >= self.drop_ack_percent / 100:
-            await self.send(ws, Frame("ACK", {"id": frame.headers["ack"], "subscription": frame.headers["subscription"], "sequence": str(sequence)}))
-            self.state.ack(sequence)
-        else:
-            self.log.warning("DROP_ACK_PERCENT simulated loss for sequence %s", sequence)
-        if self.disconnect_after and self.events_seen >= self.disconnect_after:
-            await ws.close()
+        self.log.info("event destination=%s body=%s", frame.headers.get("destination"), frame.body)
+        await self.send(ws, Frame("ACK", {"id": frame.headers["ack"]}))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination", default="/origin/demo")
-    parser.add_argument("--client-id", default="playground-client")
     parser.add_argument("--url", default=os.getenv("STOMP_URL", "ws://localhost:8080"))
     parser.add_argument("--reconnect", action="store_true")
     parser.add_argument("--heartbeat", type=int, default=10000, help="heartbeat interval in milliseconds")

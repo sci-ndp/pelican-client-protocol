@@ -1,26 +1,15 @@
 services:
   server:
     build: ./stomp-server
-    command: python server.py --port 8080 --replay-window 1000
+    command: python server.py --port 8080
     ports:
       - "8080:8080"
-    environment:
-      SERVER_DB: /data/server.sqlite3
-      DROP_EVENT_PERCENT: ${DROP_EVENT_PERCENT:-0}
-      SERVER_RESTART: ${SERVER_RESTART:-0}
-    volumes:
-      - server-data:/data
 
   client:
     build: ./stomp-client
-    command: python client.py --destination /origin/demo --client-id playground-client --reconnect
+    command: python client.py --destination /origin/demo --reconnect
     environment:
       STOMP_URL: ws://server:8080
-      CLIENT_DB: /data/client.sqlite3
-      DROP_ACK_PERCENT: ${DROP_ACK_PERCENT:-0}
-      DISCONNECT_AFTER: ${DISCONNECT_AFTER:-0}
-    volumes:
-      - client-data:/data
     depends_on:
       - server
 
@@ -41,7 +30,3 @@ services:
       - "8000:8000"
     depends_on:
       - server
-
-volumes:
-  server-data:
-  client-data:
