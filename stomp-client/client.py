@@ -63,7 +63,8 @@ class StompClient:
 
     async def on_message(self, ws, frame: Frame) -> None:
         self.log.info("event destination=%s body=%s", frame.headers.get("destination"), frame.body)
-        await self.send(ws, Frame("ACK", {"id": frame.headers["ack"]}))
+        if frame.headers.get("ack"):
+            await self.send(ws, Frame("ACK", {"id": frame.headers["ack"]}))
 
 
 def main() -> None:

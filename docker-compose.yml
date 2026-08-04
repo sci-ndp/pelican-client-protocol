@@ -1,7 +1,7 @@
 services:
   server:
-    build: ./stomp-server
-    command: python server.py --port 8080
+    build: ./stomp-server-go
+    command: stomp-server-go --port 8080
     ports:
       - "8080:8080"
 
