@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STOMP Client</title>
+  <style>
+    :root{color-scheme:dark;--bg:#10151c;--panel:#18212c;--line:#2b3948;--muted:#91a2b5;--green:#54d68a;--red:#ff8b8b}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf4fb;font:14px system-ui,sans-serif}main{max-width:900px;margin:auto;padding:32px 20px}h1{margin:0 0 6px}p{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-top:18px}.form{display:grid;grid-template-columns:1fr 150px;gap:12px}label{display:grid;gap:5px;color:var(--muted)}input{background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px}button{background:var(--green);border:0;border-radius:6px;padding:10px 15px;font-weight:700;cursor:pointer}button.secondary{background:#344454;color:#fff}.actions{display:flex;gap:10px;align-items:center;margin-top:14px}.status{margin-left:auto;color:var(--muted)}.connected{color:var(--green)}.error{color:var(--red)}pre{min-height:260px;max-height:430px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d131a;border:1px solid var(--line);border-radius:7px;padding:12px;font:12px ui-monospace,monospace;color:#c9e4ff}@media(max-width:650px){.form{grid-template-columns:1fr}.status{margin-left:0}}
+  </style>
+</head>
+<body><main>
+  <h1>STOMP Client</h1>
+  <p>This intentionally small client opens one STOMP 1.2 WebSocket connection and sends a heartbeat line-feed at the negotiated interval. Request controls will be added here next.</p>
+  <section class="card">
+    <div class="form">
+      <label>Server WebSocket URL<input id="url" value="ws://localhost:8080"></label>
+      <label>Heartbeat (ms)<input id="heartbeat" type="number" min="1000" value="10000"></label>
+      <label>Subscribe destination<input id="destination" value="/origin/demo"></label>
+    </div>
+    <div class="actions"><button id="connect">Open connection</button><button id="disconnect" class="secondary">Disconnect</button><span id="status" class="status">Disconnected</span></div>
+  </section>
+  <section class="card"><h2>Received events</h2><pre id="events">No messages yet.</pre></section>
+  <section class="card"><h2>Connection and frame log</h2><pre id="log">Ready. No request has been sent.</pre></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);let socket=null,heartbeatTimer=null;
+function log(message){$('log').textContent+=`\n${new Date().toLocaleTimeString()} ${message}`;$('log').scrollTop=$('log').scrollHeight}
+function status(message,kind=''){$('status').textContent=message;$('status').className='status '+kind}
+function frame(command,headers={},body=''){return command+'\n'+Object.entries(headers).map(([k,v])=>k+':'+v).join('\n')+'\n\n'+body+'\0'}
+function parse(raw){const text=raw.replace(/\0$/,'');const parts=text.split('\n\n');const lines=parts.shift().split('\n');const headers={};for(const line of lines.slice(1)){const i=line.indexOf(':');if(i>=0)headers[line.slice(0,i)]=line.slice(i+1)}return {command:lines[0],headers,body:parts.join('\n\n')}}
+function send(command,headers={},body=''){const raw=frame(command,headers,body);socket.send(raw);log('CLIENT → SERVER\n'+raw.replace(/\0/g,'<NUL>'))}
+function websocketUrl(value){const url=new URL(value,window.location.href);if(url.protocol==='http:')url.protocol='ws:';else if(url.protocol==='https:')url.protocol='wss:';if(!['ws:','wss:'].includes(url.protocol))throw new Error('Use an http(s) or ws(s) URL');return url.toString()}
+function connect(){if(socket&&socket.readyState<2)socket.close();const ms=Math.max(1000,Number($('heartbeat').value)||10000);const target=websocketUrl($('url').value);status('Connecting…');log('HTTP REQUEST → GET '+target+' with Upgrade: websocket');socket=new WebSocket(target);socket.binaryType='arraybuffer';socket.onopen=()=>{status('Connected','connected');log('HTTP RESPONSE ← 101 Switching Protocols; WebSocket transport established');log('STOMP begins after the HTTP upgrade');send('CONNECT',{'accept-version':'1.2',host:'playground','client-id':'browser-client-ui','heart-beat':`${ms},${ms}`});clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>{if(socket.readyState===1){socket.send('\n');log('CLIENT → SERVER  HEARTBEAT (LF)')}},ms)};socket.onmessage=e=>{if(e.data==='\n'||(e.data instanceof ArrayBuffer&&new TextDecoder().decode(e.data)==='\n')){log('SERVER → CLIENT  HEARTBEAT (LF)');return}const text=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);log('SERVER → CLIENT\n'+text.replace(/\0/g,'<NUL>'));const received=parse(text);if(received.command==='CONNECTED'){send('SUBSCRIBE',{id:'browser-client-sub',destination:$('destination').value,ack:'client-individual','last-sequence':'0'});}else if(received.command==='MESSAGE'){ $('events').textContent=new Date().toLocaleTimeString()+'\nsequence: '+(received.headers.sequence||'')+'\n destination: '+(received.headers.destination||'')+'\n\n'+received.body+'\n\n'+$('events').textContent; send('ACK',{id:received.headers.ack||received.headers['message-id'],subscription:received.headers.subscription,sequence:received.headers.sequence}); }};socket.onerror=()=>{status('Connection error','error');log('connection error')};socket.onclose=()=>{clearInterval(heartbeatTimer);status('Disconnected');log('connection closed')}}
+function disconnect(){clearInterval(heartbeatTimer);if(socket&&socket.readyState===1){send('DISCONNECT');setTimeout(()=>socket.close(1000,'user disconnected'),100)}else status('Disconnected')}
+$('connect').onclick=connect;$('disconnect').onclick=disconnect;
+</script></body></html>

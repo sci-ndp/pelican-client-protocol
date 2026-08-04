@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STOMP 1.2 Playground</title>
+  <style>
+    :root { color-scheme: dark; --bg:#10151c; --panel:#18212c; --line:#2b3948; --muted:#91a2b5; --green:#54d68a; --blue:#73b8ff; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:#edf4fb; font:14px system-ui,sans-serif; }
+    main { max-width:1100px; margin:0 auto; padding:32px 20px; } h1 { margin:0 0 6px; font-size:28px; } p { color:var(--muted); margin-top:0; }
+    .toolbar, .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:18px; }
+    .toolbar { display:flex; gap:10px; flex-wrap:wrap; align-items:end; } label { color:var(--muted); display:grid; gap:5px; } input { background:#0f151c; border:1px solid var(--line); color:inherit; border-radius:6px; padding:8px; }
+    button { border:0; border-radius:6px; padding:9px 14px; cursor:pointer; background:var(--green); color:#07130c; font-weight:700; } button.secondary { background:#344454; color:#fff; }
+    .status { margin-left:auto; color:var(--muted); } .status.connected { color:var(--green); } .status.error { color:#ff8b8b; }
+    .grid { display:grid; grid-template-columns:2fr 1fr; gap:18px; } @media(max-width:760px){.grid{grid-template-columns:1fr}.status{margin-left:0}}
+    h2 { margin:0 0 12px; font-size:17px; } table { width:100%; border-collapse:collapse; } th,td { border-bottom:1px solid var(--line); padding:9px 6px; text-align:left; vertical-align:top; } th { color:var(--muted); font-weight:500; } td.seq { color:var(--blue); font-weight:700; } td.body { font-family:ui-monospace,monospace; white-space:pre-wrap; word-break:break-word; }
+    #log { max-height:340px; overflow:auto; font:12px ui-monospace,monospace; color:var(--muted); white-space:pre-wrap; } #raw-frame { margin:0; max-height:340px; overflow:auto; background:#0d131a; border:1px solid var(--line); border-radius:7px; padding:12px; color:#c9e4ff; font:12px ui-monospace,monospace; white-space:pre-wrap; word-break:break-word; } .empty { color:var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>STOMP 1.2 Playground</h1>
+  <p>Browser subscriber for the Docker playground. Events come from the WebSocket server and are ACKed by this page.</p>
+  <section class="toolbar">
+    <label>WebSocket URL <input id="url" value="ws://localhost:8080"></label>
+    <label>Destination <input id="destination" value="/origin/demo"></label>
+    <label>Last sequence <input id="last" type="number" min="0" value="0"></label>
+    <button id="connect">Connect</button><button id="disconnect" class="secondary">Disconnect</button><button id="clear" class="secondary">Clear</button>
+    <span id="status" class="status">Disconnected</span>
+  </section>
+  <section class="card">
+    <h2>Teaching controls</h2>
+    <p>These buttons inject faults into the real server/client flow. The dashboard records each request and recovery step.</p>
+    <div class="toolbar" style="padding:0;border:0;margin-top:0">
+      <button id="client-crash" class="secondary">Simulate client crash</button>
+      <button id="server-restart" class="secondary">Simulate server restart</button>
+      <button id="drop-next" class="secondary">Drop next MESSAGE</button>
+      <button id="reorder-next" class="secondary">Reorder next 2 MESSAGEs</button>
+      <button id="pause-events" class="secondary">Stop events</button>
+      <button id="resume-events">Resume events</button>
+      <label style="display:flex;align-items:center;gap:6px"><input id="pause-acks" type="checkbox"> Pause ACKs</label>
+      <label style="display:flex;align-items:center;gap:6px"><input id="auto-reconnect" type="checkbox" checked> Auto-reconnect</label>
+    </div>
+  </section>
+  <div class="grid">
+    <section class="card"><h2>Live events</h2><div id="empty" class="empty">Connect to start receiving events.</div><table hidden id="events"><thead><tr><th>Sequence</th><th>Timestamp</th><th>Message ID</th><th>Payload</th></tr></thead><tbody></tbody></table></section>
+    <section class="card"><h2>Last STOMP frame</h2><pre id="raw-frame">No frames yet.</pre><h2 style="margin-top:18px">Frame log</h2><div id="log"></div></section>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id); let socket, subscription = 'browser-subscription'; let reconnectTimer; let manualDisconnect = false;
+let ackedSequence = Number(localStorage.getItem('stomp-playground-acked-sequence') || $('last').value || 0); $('last').value = ackedSequence;
+function esc(value) { return String(value).replaceAll('\\','\\\\').replaceAll('\n','\\n').replaceAll(':','\\c').replaceAll('\r','\\r'); }
+function frame(command, headers={}, body='') { return command+'\n'+Object.entries(headers).map(([k,v])=>k+':'+esc(v)).join('\n')+'\n\n'+body+'\0'; }
+function parse(raw) { const text=(typeof raw==='string'?raw:new TextDecoder().decode(raw)).replace(/\0$/,''); const [head,...rest]=text.split('\n\n'); const lines=head.split('\n'); const headers={}; for(const line of lines.slice(1)){ const i=line.indexOf(':'); if(i>0) headers[line.slice(0,i)]=line.slice(i+1).replaceAll('\\n','\n').replaceAll('\\r','\r').replaceAll('\\c',':').replaceAll('\\\\','\\'); } return {command:lines[0],headers,body:rest.join('\n\n')}; }
+const savedLog = localStorage.getItem('stomp-playground-log') || '';
+if (savedLog) $('log').textContent = savedLog;
+function log(text) { $('log').textContent += new Date().toLocaleTimeString()+' '+text+'\n'; localStorage.setItem('stomp-playground-log', $('log').textContent); $('log').scrollTop=$('log').scrollHeight; }
+function status(text, cls='') { $('status').textContent=text; $('status').className='status '+cls; }
+function displayFrame(direction, raw) { const text=typeof raw==='string'?raw:new TextDecoder().decode(raw); $('raw-frame').textContent=direction+'\n\n'+text.replace(/\0/g,'<NUL>'); }
+function send(command, headers={}, body='') { const raw=frame(command,headers,body); socket.send(raw); displayFrame('CLIENT → SERVER',raw); log('CLIENT -> SERVER  '+command+'\n'+raw.replace(/\0/g,'<NUL>')); }
+function connect() { manualDisconnect=false; clearTimeout(reconnectTimer); if(socket && socket.readyState<2) socket.close(); log('connection requested'); status('Connecting…'); socket=new WebSocket($('url').value); socket.binaryType='arraybuffer'; socket.onopen=()=>{ log('connection established'); send('CONNECT',{'accept-version':'1.2',host:'playground','client-id':'browser-dashboard','heart-beat':'10000,10000'}); }; socket.onmessage=e=>{ if(e.data==='\n') return; displayFrame('SERVER → CLIENT',e.data); const f=parse(e.data); log('SERVER -> CLIENT  '+f.command+'\n'+(typeof e.data==='string'?e.data:new TextDecoder().decode(e.data)).replace(/\0/g,'<NUL>')); if(f.command==='CONNECTED'){ status('Connected','connected'); send('SUBSCRIBE',{id:subscription,destination:$('destination').value,ack:'client-individual','last-sequence':ackedSequence}); } else if(f.command==='MESSAGE') receive(f); else if(f.command==='ERROR'){ status('Server error','error'); log('ERROR: '+f.body); } }; socket.onclose=()=>{ status('Disconnected'); log('connection closed'); if(!manualDisconnect && $('auto-reconnect').checked){ log('client recovery: reconnecting from last ACKed sequence '+ackedSequence); reconnectTimer=setTimeout(connect,1000); } }; socket.onerror=()=>{ status('Connection error','error'); log('connection error'); }; }
+function disconnect() { manualDisconnect=true; clearTimeout(reconnectTimer); if (socket && socket.readyState === 1) { send('DISCONNECT'); setTimeout(() => socket.close(1000, 'user disconnected'), 100); } else { status('Disconnected'); } }
+function receive(f) { const sequence=Number(f.headers.sequence); const expected=ackedSequence+1; if(sequence>expected){ log('RECOVERY: sequence gap detected; expected '+expected+', received '+sequence+'. Reconnecting for replay.'); socket.close(4001,'sequence gap'); return; } if(sequence<=ackedSequence){ log('RECOVERY: duplicate/out-of-order sequence '+sequence+' ignored and ACKed'); send('ACK',{id:f.headers.ack||f.headers['message-id'],subscription:subscription,sequence:String(sequence)}); return; } $('empty').hidden=true; $('events').hidden=false; const row=document.createElement('tr'); row.innerHTML='<td class="seq"></td><td></td><td></td><td class="body"></td>'; row.children[0].textContent=f.headers.sequence; row.children[1].textContent=f.headers.timestamp||''; row.children[2].textContent=f.headers['message-id']||''; row.children[3].textContent=f.body; $('events').querySelector('tbody').prepend(row); if($('pause-acks').checked){ log('CLIENT fault simulation: ACK withheld for sequence '+sequence); return; } send('ACK',{id:f.headers.ack||f.headers['message-id'],subscription:subscription,sequence:String(sequence)}); ackedSequence=sequence; $('last').value=sequence; localStorage.setItem('stomp-playground-acked-sequence',String(sequence)); }
+function demo(action) { if(!socket || socket.readyState!==1){ log('Cannot run '+action+': browser client is disconnected'); return; } log('DEMO request: '+action); send('DEMO',{action:action,receipt:'demo-'+action}); }
+function generator(action) { fetch('http://localhost:8090/'+action).then(r=>r.json()).then(x=>log('GENERATOR '+action.toUpperCase()+': '+JSON.stringify(x))).catch(e=>log('GENERATOR control failed: '+e)); }
+$('connect').onclick=connect; $('disconnect').onclick=disconnect; $('clear').onclick=()=>{ $('events').querySelector('tbody').replaceChildren(); $('events').hidden=true; $('empty').hidden=false; $('log').textContent=''; $('raw-frame').textContent='No frames yet.'; localStorage.removeItem('stomp-playground-log'); };
+$('client-crash').onclick=()=>{ if(socket){ log('CLIENT CRASH simulated: closing without DISCONNECT; persisted ACK='+ackedSequence); socket.close(); } };
+$('server-restart').onclick=()=>demo('restart-server'); $('drop-next').onclick=()=>demo('drop-next'); $('reorder-next').onclick=()=>demo('reorder-next'); $('pause-events').onclick=()=>generator('pause'); $('resume-events').onclick=()=>generator('resume');
+</script>
+</body>
+</html>

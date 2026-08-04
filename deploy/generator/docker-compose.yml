@@ -1,0 +1,11 @@
+services:
+  event-generator:
+    build:
+      context: ../../event-generator
+    command: python generator.py --destination ${DESTINATION:-/origin/demo} --rate ${RATE_SECONDS:-2}
+    restart: unless-stopped
+    environment:
+      STOMP_URL: ${STOMP_URL:?Set STOMP_URL to the server VM WebSocket URL}
+      CONTROL_PORT: 8090
+    ports:
+      - "${CONTROL_PORT:-8090}:8090"
