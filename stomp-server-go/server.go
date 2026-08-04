@@ -153,6 +153,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 			frame := res.frame
 			if frame.Command == "HEARTBEAT" {
+				log.Println("CLIENT -> SERVER  HEARTBEAT")
 				continue
 			}
 			log.Printf("CLIENT -> SERVER  %s", frame.Command)
@@ -164,6 +165,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			if err := s.sendBytes(sess, []byte("\n")); err != nil {
 				return
 			}
+			log.Println("SERVER -> CLIENT  HEARTBEAT")
 		}
 	}
 }
