@@ -118,35 +118,59 @@ func (s *Server) handleConn(conn net.Conn) {
 		conn.Close()
 	}()
 
-	for {
-		conn.SetReadDeadline(time.Now().Add(readTimeout))
-		frame, err := readFrame(conn)
-		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				if err := s.sendBytes(sess, []byte("\n")); err != nil {
-					return
-				}
-				continue
-			}
-			var protoErr *ProtocolError
-			if errors.As(err, &protoErr) {
-				s.send(sess, NewFrame("ERROR", map[string]string{"message": protoErr.Error()}, protoErr.Error()))
+	// gorilla/websocket permanently poisons a connection after any failed
+	// read -- including one that only failed because a SetReadDeadline
+	// expired -- so a second read on the same Conn panics with "repeated
+	// read on failed websocket connection". That rules out the obvious
+	// SetReadDeadline-plus-retry-loop approach to idle-heartbeat timing.
+	// Instead a dedicated goroutine reads with no deadline at all, and the
+	// loop below waits on either a frame or an idle timer, which is what
+	// actually mirrors the Python server's
+	// `asyncio.wait_for(read_frame(...), timeout=90)`: that cancels at the
+	// coroutine level without ever touching the underlying socket's read
+	// state, so it can be retried indefinitely.
+	frames := make(chan readResult, 1)
+	go func() {
+		for {
+			frame, err := readFrame(conn)
+			frames <- readResult{frame, err}
+			if err != nil {
 				return
 			}
-			// connection closed, or some other I/O error: clean up via defer
-			return
 		}
+	}()
 
-		if frame.Command == "HEARTBEAT" {
-			continue
-		}
-		log.Printf("CLIENT -> SERVER  %s", frame.Command)
-		if err := s.dispatch(sess, frame); err != nil {
-			log.Printf("command failed: %v", err)
-			s.send(sess, NewFrame("ERROR", map[string]string{"message": err.Error()}, err.Error()))
+	for {
+		select {
+		case res := <-frames:
+			if res.err != nil {
+				var protoErr *ProtocolError
+				if errors.As(res.err, &protoErr) {
+					s.send(sess, NewFrame("ERROR", map[string]string{"message": res.err.Error()}, res.err.Error()))
+				}
+				// connection closed, or some other I/O error: clean up via defer
+				return
+			}
+			frame := res.frame
+			if frame.Command == "HEARTBEAT" {
+				continue
+			}
+			log.Printf("CLIENT -> SERVER  %s", frame.Command)
+			if err := s.dispatch(sess, frame); err != nil {
+				log.Printf("command failed: %v", err)
+				s.send(sess, NewFrame("ERROR", map[string]string{"message": err.Error()}, err.Error()))
+			}
+		case <-time.After(readTimeout):
+			if err := s.sendBytes(sess, []byte("\n")); err != nil {
+				return
+			}
 		}
 	}
+}
+
+type readResult struct {
+	frame *Frame
+	err   error
 }
 
 func (s *Server) sendBytes(sess *session, data []byte) error {
