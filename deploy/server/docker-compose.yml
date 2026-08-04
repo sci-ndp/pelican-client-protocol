@@ -2,8 +2,8 @@ services:
   stomp-server:
     image: hub.osg-htc.org/mwestphall/stomp-server
     build:
-      context: ../../stomp-server
-    command: python server.py --port 8080
+      context: ../../stomp-server-go
+    command: stomp-server-go --port 8080
     restart: unless-stopped
     ports:
       - "${SERVER_PORT:-8080}:8080"

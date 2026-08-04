@@ -8,18 +8,16 @@ import (
 )
 
 // wsConn adapts a gorilla/websocket connection to the net.Conn interface
-// that go-stomp's server/client package expects (it was written for raw
-// TCP STOMP and reads/writes frames via frame.Reader/frame.Writer directly
-// on top of a net.Conn). This is the "custom websocket communication layer"
-// bridging STOMP-over-WebSocket to that library code: everything above the
-// net.Conn interface (frame parsing, the connection state machine, topics,
-// queues) stays exactly as provided by go-stomp.
+// used by the STOMP server below (server.go), so that server logic is
+// written against the standard net.Conn interface rather than directly
+// against gorilla/websocket. This is the "custom websocket communication
+// layer" bridging STOMP-over-WebSocket to that server code.
 //
 // Each WebSocket message carries exactly one STOMP frame (or the lone LF
 // heartbeat), matching how stomp-client and stomp-server already exchange
-// frames one-per-message. Read/Write still present a byte-stream interface
-// so that frame.Reader/frame.Writer (which are stream-oriented) work
-// unmodified.
+// frames one-per-message. Read/Write still present a byte-stream interface,
+// but readFrame (protocol.go) relies on each Read returning exactly one
+// WebSocket message by using a buffer sized larger than any real frame.
 type wsConn struct {
 	ws   *websocket.Conn
 	rbuf []byte // leftover bytes from the most recently read WS message
