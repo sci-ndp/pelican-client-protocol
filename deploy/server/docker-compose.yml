@@ -1,5 +1,6 @@
 services:
   stomp-server:
+    image: hub.osg-htc.org/mwestphall/stomp-server
     build:
       context: ../../stomp-server
     command: python server.py --port 8080 --replay-window ${REPLAY_WINDOW:-1000}
@@ -14,6 +15,7 @@ services:
       - server-data:/data
 
   server-ui:
+    image: hub.osg-htc.org/mwestphall/stomp-server-ui
     build:
       context: ../../server-ui
     restart: unless-stopped
