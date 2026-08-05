@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -44,9 +45,10 @@ func (noAuth) Authenticate(http.ResponseWriter, *http.Request) bool { return tru
 type basicAuth struct {
 	realm     string
 	passwords map[string]string // username -> bcrypt hash
+	log       *slog.Logger
 }
 
-func newBasicAuth(htpasswdPath string) (*basicAuth, error) {
+func newBasicAuth(htpasswdPath string, log *slog.Logger) (*basicAuth, error) {
 	f, err := os.Open(htpasswdPath)
 	if err != nil {
 		return nil, fmt.Errorf("open htpasswd file: %w", err)
@@ -72,7 +74,7 @@ func newBasicAuth(htpasswdPath string) (*basicAuth, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read htpasswd file: %w", err)
 	}
-	return &basicAuth{realm: "stomp-playground", passwords: passwords}, nil
+	return &basicAuth{realm: "stomp-playground", passwords: passwords, log: log}, nil
 }
 
 func isBcryptHash(hash string) bool {
@@ -87,8 +89,10 @@ func isBcryptHash(hash string) bool {
 func (a *basicAuth) Authenticate(w http.ResponseWriter, r *http.Request) bool {
 	user, pass, ok := r.BasicAuth()
 	if ok && a.check(user, pass) {
+		a.log.Debug("basic auth accepted", "user", user, "remote_addr", r.RemoteAddr)
 		return true
 	}
+	a.log.Debug("basic auth rejected", "user", user, "remote_addr", r.RemoteAddr)
 	w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q", a.realm))
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
 	return false

@@ -30,7 +30,7 @@ func main() {
 
 	var authenticator Authenticator = noAuth{}
 	if *htpasswdFile != "" {
-		a, err := newBasicAuth(*htpasswdFile)
+		a, err := newBasicAuth(*htpasswdFile, logger)
 		if err != nil {
 			logger.Error("failed to load htpasswd file", "error", err)
 			os.Exit(1)
