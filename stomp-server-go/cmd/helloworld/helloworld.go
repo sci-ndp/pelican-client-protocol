@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"stomp-server-go/internal/stomp"
 )
 
 // helloWorldApp is a small application layer built entirely on the
@@ -12,7 +14,7 @@ import (
 // destination, it starts a per-destination timer that publishes a
 // "Hello, World" MESSAGE to that destination every helloWorldInterval.
 type helloWorldApp struct {
-	srv      StompServer
+	srv      stomp.StompServer
 	log      *slog.Logger
 	interval time.Duration
 
@@ -24,7 +26,7 @@ const helloWorldInterval = 10 * time.Second
 
 // newHelloWorldApp registers itself as a subscriber to srv's subscription
 // events and returns the running app.
-func newHelloWorldApp(srv StompServer, log *slog.Logger) *helloWorldApp {
+func newHelloWorldApp(srv stomp.StompServer, log *slog.Logger) *helloWorldApp {
 	app := &helloWorldApp{
 		srv:      srv,
 		log:      log,

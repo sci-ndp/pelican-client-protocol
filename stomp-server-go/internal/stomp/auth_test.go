@@ -1,4 +1,4 @@
-package main
+package stomp
 
 import (
 	"log/slog"
@@ -37,9 +37,9 @@ func writeHtpasswd(t *testing.T, entries map[string]string) string {
 
 func TestBasicAuthAcceptsCorrectCredentials(t *testing.T) {
 	path := writeHtpasswd(t, map[string]string{"alice": "s3cret"})
-	a, err := newBasicAuth(path, discardLogger())
+	a, err := NewBasicAuth(path, discardLogger())
 	if err != nil {
-		t.Fatalf("newBasicAuth: %v", err)
+		t.Fatalf("NewBasicAuth: %v", err)
 	}
 
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -52,9 +52,9 @@ func TestBasicAuthAcceptsCorrectCredentials(t *testing.T) {
 
 func TestBasicAuthRejectsWrongPassword(t *testing.T) {
 	path := writeHtpasswd(t, map[string]string{"alice": "s3cret"})
-	a, err := newBasicAuth(path, discardLogger())
+	a, err := NewBasicAuth(path, discardLogger())
 	if err != nil {
-		t.Fatalf("newBasicAuth: %v", err)
+		t.Fatalf("NewBasicAuth: %v", err)
 	}
 
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -70,9 +70,9 @@ func TestBasicAuthRejectsWrongPassword(t *testing.T) {
 
 func TestBasicAuthRejectsMissingCredentials(t *testing.T) {
 	path := writeHtpasswd(t, map[string]string{"alice": "s3cret"})
-	a, err := newBasicAuth(path, discardLogger())
+	a, err := NewBasicAuth(path, discardLogger())
 	if err != nil {
-		t.Fatalf("newBasicAuth: %v", err)
+		t.Fatalf("NewBasicAuth: %v", err)
 	}
 
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -88,15 +88,15 @@ func TestNewBasicAuthRejectsNonBcryptHash(t *testing.T) {
 	if err := os.WriteFile(path, []byte("alice:{SHA}qUqP5cyxm6YcTAhz05Hph5gvu9M=\n"), 0o600); err != nil {
 		t.Fatalf("write htpasswd: %v", err)
 	}
-	if _, err := newBasicAuth(path, discardLogger()); err == nil {
-		t.Fatal("expected newBasicAuth to reject a non-bcrypt hash")
+	if _, err := NewBasicAuth(path, discardLogger()); err == nil {
+		t.Fatal("expected NewBasicAuth to reject a non-bcrypt hash")
 	}
 }
 
 func TestNoAuthAcceptsEverything(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
-	if !(noAuth{}).Authenticate(w, r) {
-		t.Fatal("expected noAuth to accept every request")
+	if !(NoAuth{}).Authenticate(w, r) {
+		t.Fatal("expected NoAuth to accept every request")
 	}
 }

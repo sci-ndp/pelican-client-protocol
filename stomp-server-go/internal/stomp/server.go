@@ -1,4 +1,4 @@
-package main
+package stomp
 
 import (
 	"encoding/json"
@@ -80,7 +80,7 @@ type Server struct {
 	onSubscribe   []func(headers map[string]string)
 }
 
-func newServer(log *slog.Logger) *Server {
+func NewServer(log *slog.Logger) *Server {
 	return &Server{
 		sessions:      map[net.Conn]*session{},
 		subscriptions: map[string]map[net.Conn]bool{},

@@ -1,4 +1,4 @@
-package main
+package stomp
 
 import (
 	"errors"
@@ -7,6 +7,15 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// SimpleAddr is a minimal net.Addr for wsListener.Addr(); Server.Serve never
+// actually calls it (it only matters for a ListenAndServe-style helper, which
+// callers bypass in favor of an HTTP-upgrade-fed listener), but the
+// net.Listener interface requires an implementation.
+type SimpleAddr string
+
+func (a SimpleAddr) Network() string { return "ws" }
+func (a SimpleAddr) String() string  { return string(a) }
 
 // wsListener is a net.Listener whose connections arrive from an HTTP
 // Upgrade to WebSocket rather than from a raw TCP Accept(). This is what
@@ -19,7 +28,7 @@ type wsListener struct {
 	closeCh  chan struct{}
 }
 
-func newWSListener(addr net.Addr) *wsListener {
+func NewWSListener(addr net.Addr) *wsListener {
 	return &wsListener{
 		addr: addr,
 		upgrader: websocket.Upgrader{

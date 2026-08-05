@@ -1,4 +1,4 @@
-package main
+package stomp
 
 import (
 	"encoding/base64"
@@ -18,14 +18,14 @@ import (
 func startTestServer(t *testing.T, authenticator Authenticator) string {
 	t.Helper()
 
-	listener := newWSListener(simpleAddr("test"))
+	listener := NewWSListener(SimpleAddr("test"))
 	mux := http.NewServeMux()
-	mux.Handle("/", requireAuth(authenticator, listener))
+	mux.Handle("/", RequireAuth(authenticator, listener))
 
 	httpServer := httptest.NewServer(mux)
 	t.Cleanup(httpServer.Close)
 
-	srv := newServer(discardLogger())
+	srv := NewServer(discardLogger())
 	go srv.Serve(listener)
 	t.Cleanup(func() { listener.Close() })
 
@@ -83,7 +83,7 @@ func recvMessage(t *testing.T, sub *stomp.Subscription) *stomp.Message {
 }
 
 func TestIntegration_ConnectAndDisconnect(t *testing.T) {
-	wsURL := startTestServer(t, noAuth{})
+	wsURL := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)
 
 	if conn.Version() != stomp.V12 {
@@ -98,7 +98,7 @@ func TestIntegration_ConnectAndDisconnect(t *testing.T) {
 }
 
 func TestIntegration_PublishSubscribeAutoAck(t *testing.T) {
-	wsURL := startTestServer(t, noAuth{})
+	wsURL := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
@@ -124,7 +124,7 @@ func TestIntegration_PublishSubscribeAutoAck(t *testing.T) {
 }
 
 func TestIntegration_ClientIndividualAckAndNackRedelivery(t *testing.T) {
-	wsURL := startTestServer(t, noAuth{})
+	wsURL := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckClientIndividual)
@@ -170,9 +170,9 @@ func TestIntegration_ClientIndividualAckAndNackRedelivery(t *testing.T) {
 
 func TestIntegration_BasicAuthRejectsMissingCredentials(t *testing.T) {
 	path := writeHtpasswd(t, map[string]string{"alice": "s3cret"})
-	authenticator, err := newBasicAuth(path, discardLogger())
+	authenticator, err := NewBasicAuth(path, discardLogger())
 	if err != nil {
-		t.Fatalf("newBasicAuth: %v", err)
+		t.Fatalf("NewBasicAuth: %v", err)
 	}
 	wsURL := startTestServer(t, authenticator)
 
@@ -187,9 +187,9 @@ func TestIntegration_BasicAuthRejectsMissingCredentials(t *testing.T) {
 
 func TestIntegration_BasicAuthAcceptsCorrectCredentials(t *testing.T) {
 	path := writeHtpasswd(t, map[string]string{"alice": "s3cret"})
-	authenticator, err := newBasicAuth(path, discardLogger())
+	authenticator, err := NewBasicAuth(path, discardLogger())
 	if err != nil {
-		t.Fatalf("newBasicAuth: %v", err)
+		t.Fatalf("NewBasicAuth: %v", err)
 	}
 	wsURL := startTestServer(t, authenticator)
 

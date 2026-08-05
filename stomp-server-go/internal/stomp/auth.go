@@ -1,4 +1,4 @@
-package main
+package stomp
 
 import (
 	"bufio"
@@ -20,9 +20,9 @@ type Authenticator interface {
 	Authenticate(w http.ResponseWriter, r *http.Request) bool
 }
 
-// requireAuth wraps next so every request is checked against a before being
+// RequireAuth wraps next so every request is checked against a before being
 // passed through.
-func requireAuth(a Authenticator, next http.Handler) http.Handler {
+func RequireAuth(a Authenticator, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !a.Authenticate(w, r) {
 			return
@@ -31,10 +31,10 @@ func requireAuth(a Authenticator, next http.Handler) http.Handler {
 	})
 }
 
-// noAuth is an Authenticator that admits every request.
-type noAuth struct{}
+// NoAuth is an Authenticator that admits every request.
+type NoAuth struct{}
 
-func (noAuth) Authenticate(http.ResponseWriter, *http.Request) bool { return true }
+func (NoAuth) Authenticate(http.ResponseWriter, *http.Request) bool { return true }
 
 // basicAuth is an Authenticator backed by an htpasswd file, checked via HTTP
 // Basic auth. Only bcrypt ($2a$/$2b$/$2y$, produced by `htpasswd -B`) entries
@@ -48,7 +48,7 @@ type basicAuth struct {
 	log       *slog.Logger
 }
 
-func newBasicAuth(htpasswdPath string, log *slog.Logger) (*basicAuth, error) {
+func NewBasicAuth(htpasswdPath string, log *slog.Logger) (*basicAuth, error) {
 	f, err := os.Open(htpasswdPath)
 	if err != nil {
 		return nil, fmt.Errorf("open htpasswd file: %w", err)
