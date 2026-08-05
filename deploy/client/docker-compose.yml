@@ -9,6 +9,8 @@ services:
       STOMP_URL: ${STOMP_URL:?Set STOMP_URL to the server VM WebSocket URL}
       CLIENT_DB: /data/client.sqlite3
       CLIENT_ID: ${CLIENT_ID:-remote-client}
+      STOMP_USERNAME: ${STOMP_USERNAME:-}
+      STOMP_PASSWORD: ${STOMP_PASSWORD:-}
       DROP_ACK_PERCENT: ${DROP_ACK_PERCENT:-0}
       DISCONNECT_AFTER: ${DISCONNECT_AFTER:-0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

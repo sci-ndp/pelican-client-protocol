@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import asyncio
 import json
 import logging
@@ -14,6 +15,11 @@ from websockets.exceptions import WebSocketException
 
 from persistence import ClientPersistence
 from protocol import Frame, parse
+
+
+def basic_auth_header(username: str, password: str) -> str:
+    token = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return f"Basic {token}"
 
 
 def websocket_url(value: str) -> str:
@@ -52,11 +58,15 @@ class StompClient:
         self.events_seen = 0
         self.drop_ack_percent = float(os.getenv("DROP_ACK_PERCENT", "0"))
         self.disconnect_after = int(os.getenv("DISCONNECT_AFTER", "0"))
+        self.username = self.args.username
+        self.password = self.args.password
+        if bool(self.username) != bool(self.password):
+            raise ValueError("STOMP_USERNAME and STOMP_PASSWORD must be provided together")
         self.log_buffer = next((handler for handler in self.log.handlers if isinstance(handler, ClientLogBuffer)), None)
         self.log.info(
-            "configured url=%s destination=%s client_id=%s heartbeat_ms=%s reconnect=%s log_level=%s drop_ack_percent=%s disconnect_after=%s",
+            "configured url=%s destination=%s client_id=%s heartbeat_ms=%s reconnect=%s log_level=%s basic_auth=%s auth_username=%s drop_ack_percent=%s disconnect_after=%s",
             self.args.url, self.args.destination, self.args.client_id, self.args.heartbeat,
-            self.args.reconnect, self.args.log_level, self.drop_ack_percent, self.disconnect_after,
+            self.args.reconnect, self.args.log_level, bool(self.username), self.username or "(none)", self.drop_ack_percent, self.disconnect_after,
         )
 
     async def run(self) -> None:
@@ -102,7 +112,10 @@ class StompClient:
     async def connected_session(self) -> None:
         target = websocket_url(self.args.url)
         self.log.info("opening WebSocket url=%s", target)
-        async with websockets.connect(target, ping_interval=None) as ws:
+        auth_headers = {"Authorization": basic_auth_header(self.username, self.password)} if self.username else None
+        if auth_headers:
+            self.log.info("HTTP Basic Auth enabled username=%s", self.username)
+        async with websockets.connect(target, additional_headers=auth_headers, ping_interval=None) as ws:
             await self.send(ws, Frame("CONNECT", {"accept-version": "1.2", "host": "playground", "client-id": self.args.client_id, "heart-beat": f"{self.args.heartbeat},{self.args.heartbeat}"}))
             connected = await self.receive(ws)
             if connected.command != "CONNECTED":
@@ -166,6 +179,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination", default="/origin/demo")
     parser.add_argument("--client-id", default=os.getenv("CLIENT_ID", "playground-client"))
+    parser.add_argument("--username", default=os.getenv("STOMP_USERNAME", ""), help="HTTP Basic Auth username")
+    parser.add_argument("--password", default=os.getenv("STOMP_PASSWORD", ""), help="HTTP Basic Auth password; never logged")
     parser.add_argument("--url", default=os.getenv("STOMP_URL", "ws://localhost:8080"))
     parser.add_argument("--reconnect", action="store_true")
     parser.add_argument("--heartbeat", type=int, default=10000, help="heartbeat interval in milliseconds")
