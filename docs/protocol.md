@@ -8,9 +8,10 @@ A frame is a command, zero or more `key:value` headers, a blank line, a body, an
 
 ```text
 MESSAGE
-destination:/origin/demo
+subscription:sub-0
 message-id:uuid
-sequence:42
+destination:/origin/demo
+ack:ack-uuid
 
 {"hello":"world"}\0
 ```
@@ -26,40 +27,29 @@ sequenceDiagram
     participant G as Generator
     C->>S: CONNECT (accept-version: 1.2)
     S-->>C: CONNECTED
-    C->>S: SUBSCRIBE (destination, last-sequence)
+    C->>S: SUBSCRIBE (destination, ack: client-individual)
     G->>S: SEND (JSON event)
-    S-->>C: MESSAGE (sequence, message-id)
-    C->>S: ACK (sequence)
+    S-->>C: MESSAGE (ack, message-id)
+    C->>S: ACK (id)
     C->>S: DISCONNECT
 ```
 
-The generator does not subscribe and does not know which clients exist. It reconnects to the server and publishes an event at the configured interval.
+The generator does not subscribe and does not know which clients exist. It reconnects to the server and publishes an event at the configured interval. Delivery is live-only: a subscription only sees events published while it is active, matching plain STOMP 1.2 (there is no durable-subscription or replay concept in the base spec).
 
-## Replay extension
+## ACK/NACK model
 
-`last-sequence` is an application header on `SUBSCRIBE`:
+`SUBSCRIBE`'s `ack` header controls how `MESSAGE` frames from that subscription must be acknowledged:
 
-```text
-SUBSCRIBE
-id:events
-destination:/origin/demo
-ack:client-individual
-last-sequence:55
+- `auto` (default): no `ack` header on `MESSAGE`, no acknowledgement expected.
+- `client`: `MESSAGE` carries an `ack` header (a per-delivery id). Acknowledging one message cumulatively acknowledges every earlier unacknowledged message on that subscription.
+- `client-individual`: same `ack` header, but each message must be acknowledged on its own; acknowledging one has no effect on the others.
 
-\0
-```
+The client sends `ACK {id: <ack-id>}` after processing a message, or `NACK {id: <ack-id>}` if it can't. The server tracks unacknowledged deliveries per subscription in memory:
 
-The server sends retained events with sequence greater than 55 before live events. If sequence 55 is older than the configured replay window, the server sends `ERROR`; the client can report that condition and choose a new starting point. Every event has a server-assigned sequence, UUID message-id, UTC timestamp, and destination.
+- `ACK` removes the message (and, for `client` mode, everything delivered before it) from the pending set.
+- `NACK` triggers one redelivery attempt with a fresh `ack` id. If that redelivery is also nacked, the server drops the message and logs it rather than retrying indefinitely.
 
-## ACK flow and recovery
-
-The client ACKs each `MESSAGE` and commits the sequence to its local SQLite database only after sending the ACK. If an ACK or connection is lost, the persisted sequence remains behind. On reconnect, the client subscribes with that sequence and receives the missing event(s) again. This is intentionally at-least-once delivery: consumers should make processing idempotent.
-
-`DROP_ACK_PERCENT`, `DROP_EVENT_PERCENT`, `DISCONNECT_AFTER`, and `SERVER_RESTART` are test switches. Set them in the shell before `docker compose up`; for example:
-
-```bash
-DROP_ACK_PERCENT=30 DISCONNECT_AFTER=3 docker compose up --build
-```
+There is no persistence behind this: an unacknowledged message is only held in the server process's memory for the lifetime of the connection, and a lost connection loses its pending messages. This is a smaller guarantee than durable message queuing, but it matches what STOMP 1.2 itself defines.
 
 ## Heartbeats
 
@@ -71,23 +61,12 @@ The client advertises a heartbeat interval. The server disables WebSocket ping f
 docker compose up --build
 ```
 
-Open [http://localhost:8000](http://localhost:8000) for the browser dashboard. It is a thin WebSocket client: it connects to the server on port 8080, subscribes to `/origin/demo`, shows live `MESSAGE` frames, and sends an `ACK` for each event. The command-line client remains useful for observing the server-side protocol logs.
-
-## Guided failure demonstrations
-
-The dashboard's teaching controls exercise the real service behavior:
-
-1. Click **Stop events**, then **Connect** and observe `CONNECT`, `CONNECTED`, and `SUBSCRIBE` frames without new messages. Click **Resume events** to restart publishing.
-2. Click **Simulate client crash**. The browser closes without `DISCONNECT`; with auto-reconnect enabled it reconnects using its persisted last ACKed sequence.
-3. Click **Drop next MESSAGE**. The server deliberately loses one message. When the browser sees a sequence gap, it reconnects with the last good sequence and receives the missing event from SQLite replay.
-4. Click **Reorder next 2 MESSAGEs**. The server sends two messages out of order. The client detects the unexpected sequence and reconnects, turning ordering into replay rather than silently acknowledging the wrong state.
-5. Click **Simulate server restart**. The server closes active WebSockets but leaves the SQLite volume intact. The client reconnects and resumes from its last ACK.
-6. Enable **Pause ACKs** to see messages arrive without acknowledgements; simulate a client crash, uncheck it, and reconnect to replay those unacknowledged events.
+Open [http://localhost:8000](http://localhost:8000) for the browser dashboard. It is a thin WebSocket client: it connects to the server on port 8080, subscribes to `/origin/demo` with a selectable `ack` mode, shows live `MESSAGE` frames, and lets you ACK or NACK each one. The command-line client remains useful for observing the server-side protocol logs.
 
 The raw frame panel shows the complete frame in each direction, including headers, body, and the NULL terminator. The frame log is kept in browser storage until **Clear** is pressed.
 
-SQLite files are kept in the `server-data` and `client-data` named volumes. To experiment without Docker, install each service's requirements and run `python server.py`, `python client.py --reconnect`, and `python generator.py` in separate terminals.
+To experiment without Docker, install each service's requirements and run `python server.py`, `python client.py --reconnect`, and `python generator.py` in separate terminals.
 
 ## Extension ideas
 
-The command dispatch table is intentionally explicit, making `BEGIN`, `COMMIT`, and `ABORT` good exercises. Other natural extensions are durable subscription metadata, NACK-driven replay, message expiration, and a dead-letter table.
+The command dispatch table is intentionally explicit, making `BEGIN`, `COMMIT`, and `ABORT` good exercises. Other natural extensions are durable subscription metadata, message expiration, and a dead-letter table.

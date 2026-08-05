@@ -2,35 +2,71 @@
 <html lang="en">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>STOMP Client</title>
+  <title>STOMP Message Queue Client Monitor</title>
   <style>
-    :root{color-scheme:dark;--bg:#10151c;--panel:#18212c;--line:#2b3948;--muted:#91a2b5;--green:#54d68a;--red:#ff8b8b}
-    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf4fb;font:14px system-ui,sans-serif}main{max-width:900px;margin:auto;padding:32px 20px}h1{margin:0 0 6px}p{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-top:18px}.form{display:grid;grid-template-columns:1fr 150px;gap:12px}label{display:grid;gap:5px;color:var(--muted)}input{background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px}button{background:var(--green);border:0;border-radius:6px;padding:10px 15px;font-weight:700;cursor:pointer}button.secondary{background:#344454;color:#fff}.actions{display:flex;gap:10px;align-items:center;margin-top:14px}.status{margin-left:auto;color:var(--muted)}.connected{color:var(--green)}.error{color:var(--red)}pre{min-height:260px;max-height:430px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d131a;border:1px solid var(--line);border-radius:7px;padding:12px;font:12px ui-monospace,monospace;color:#c9e4ff}@media(max-width:650px){.form{grid-template-columns:1fr}.status{margin-left:0}}
+    :root{color-scheme:dark;--bg:#10151c;--panel:#18212c;--line:#2b3948;--muted:#91a2b5;--green:#54d68a;--red:#ff8b8b;--amber:#f5bf61}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf4fb;font:14px system-ui,sans-serif}main{max-width:980px;margin:auto;padding:32px 20px}h1{margin:0 0 6px}h2{margin-top:0;font-size:17px}p{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-top:18px}.form{display:grid;grid-template-columns:1fr 150px;gap:12px}label{display:grid;gap:5px;color:var(--muted)}input,select{background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px}input[readonly]{color:var(--amber)}button{background:var(--green);border:0;border-radius:6px;padding:10px 15px;font-weight:700;cursor:pointer}button.secondary{background:#344454;color:#fff}button.warn{background:var(--amber);color:#18212c}.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}.status{margin-left:auto;color:var(--muted)}.connected{color:var(--green)}.error{color:var(--red)}pre{min-height:220px;max-height:430px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d131a;border:1px solid var(--line);border-radius:7px;padding:12px;font:12px ui-monospace,monospace;color:#c9e4ff}@media(max-width:650px){.form{grid-template-columns:1fr}.status{margin-left:0}}
   </style>
 </head>
 <body><main>
-  <h1>STOMP Client</h1>
-  <p>This intentionally small client opens one STOMP 1.2 WebSocket connection and sends a heartbeat line-feed at the negotiated interval. Request controls will be added here next.</p>
+  <h1>STOMP Message Queue Client Monitor</h1>
+  <p>The Python client owns the only STOMP/WebSocket connection. This UI only uses the client’s HTTP application API for configuration, status, logs, and fault simulation.</p>
   <section class="card">
+    <h2>Client configuration</h2>
     <div class="form">
-      <label>Server WebSocket URL<input id="url" value="ws://localhost:8080"></label>
-      <label>Heartbeat (ms)<input id="heartbeat" type="number" min="1000" value="10000"></label>
-      <label>Subscribe destination<input id="destination" value="/origin/demo"></label>
+      <label>Upstream server WebSocket URL<input id="url"></label>
+      <label>Heartbeat (ms)<input id="heartbeat" type="number" min="1000"></label>
+      <label>Log detail<select id="log-level"><option value="INFO">INFO summaries</option><option value="DEBUG">DEBUG frames</option></select></label>
+      <label>STOMP client ID<input id="client-id"></label>
+      <label>Queue subscription key<input id="subscription"></label>
+      <label>Event source<input id="event-source"></label>
+      <label>Derived server channel<input id="destination" readonly></label>
+      <label>Username<input id="username" autocomplete="username"></label>
+      <label>Password<input id="password" type="password" autocomplete="current-password" placeholder="Leave unchanged"></label>
     </div>
-    <div class="actions"><button id="connect">Open connection</button><button id="disconnect" class="secondary">Disconnect</button><span id="status" class="status">Disconnected</span></div>
+    <div class="actions"><button id="connect">Apply settings and reconnect</button><button id="disconnect" class="secondary">Disconnect client</button><span id="status" class="status">Loading client status…</span></div>
   </section>
-  <section class="card"><h2>Received events</h2><pre id="events">No messages yet.</pre></section>
-  <section class="card"><h2>Connection and frame log</h2><pre id="log">Ready. No request has been sent.</pre></section>
+  <section class="card">
+    <h2>Fault simulation</h2>
+    <p>These controls change only client application behavior. “Drop 17 ACKs” lets the server exhaust its 16-retry budget, close the connection, then the client reconnects and resumes its persistent queue.</p>
+    <div class="actions">
+      <button id="drop-one" class="warn">Drop next ACK</button>
+      <button id="drop-exhaust" class="warn">Drop 17 ACKs (server closes)</button>
+      <button id="disconnect-next" class="warn">Disconnect before next ACK</button>
+      <button id="close-now" class="warn">Close connection now</button>
+      <label>Random ACK loss (%)<input id="random-loss" type="number" min="0" max="100" value="0"></label>
+      <button id="set-random" class="secondary">Set random loss</button>
+      <button id="reset-sim" class="secondary">Reset simulations</button>
+    </div>
+  </section>
+  <section class="card"><h2>Client status</h2><pre id="client-status">Waiting for application API…</pre></section>
+  <section class="card"><h2>Application actions</h2><pre id="log">Ready. The Python client owns the STOMP connection.</pre></section>
+  <section class="card"><h2>Python client service logs</h2><p>Client-side connection state, message frames, ACK decisions, retries, reconnects, and heartbeats.</p><pre id="client-logs">Waiting for client log endpoint…</pre></section>
 </main>
 <script>
-const $=id=>document.getElementById(id);let socket=null,heartbeatTimer=null;
-function log(message){$('log').textContent+=`\n${new Date().toLocaleTimeString()} ${message}`;$('log').scrollTop=$('log').scrollHeight}
+const $=id=>document.getElementById(id),NL=String.fromCharCode(10);
+const apiBase=window.location.protocol+'//'+window.location.hostname+':8081';
+const settingsKey='stomp-messagequeue-ui-settings';
+let loaded=false;
+const settingIds=['url','heartbeat','log-level','client-id','subscription','event-source','username'];
+function savedSettings(){try{return JSON.parse(localStorage.getItem(settingsKey)||'{}')}catch(error){return {}}}
+function saveSettings(){const values={};for(const id of settingIds)values[id]=$(id).value;localStorage.setItem(settingsKey,JSON.stringify(values))}
+function channel(){return $('subscription').value.trim()+'/'+$('event-source').value.trim()}
+function updateChannel(){$('destination').value=channel()}
+function log(message){$('log').textContent+=NL+new Date().toLocaleTimeString()+' '+message;$('log').scrollTop=$('log').scrollHeight}
 function status(message,kind=''){$('status').textContent=message;$('status').className='status '+kind}
-function frame(command,headers={},body=''){return command+'\n'+Object.entries(headers).map(([k,v])=>k+':'+v).join('\n')+'\n\n'+body+'\0'}
-function parse(raw){const text=raw.replace(/\0$/,'');const parts=text.split('\n\n');const lines=parts.shift().split('\n');const headers={};for(const line of lines.slice(1)){const i=line.indexOf(':');if(i>=0)headers[line.slice(0,i)]=line.slice(i+1)}return {command:lines[0],headers,body:parts.join('\n\n')}}
-function send(command,headers={},body=''){const raw=frame(command,headers,body);socket.send(raw);log('CLIENT → SERVER\n'+raw.replace(/\0/g,'<NUL>'))}
-function websocketUrl(value){const url=new URL(value,window.location.href);if(url.protocol==='http:')url.protocol='ws:';else if(url.protocol==='https:')url.protocol='wss:';if(!['ws:','wss:'].includes(url.protocol))throw new Error('Use an http(s) or ws(s) URL');return url.toString()}
-function connect(){if(socket&&socket.readyState<2)socket.close();const ms=Math.max(1000,Number($('heartbeat').value)||10000);const target=websocketUrl($('url').value);status('Connecting…');log('HTTP REQUEST → GET '+target+' with Upgrade: websocket');socket=new WebSocket(target);socket.binaryType='arraybuffer';socket.onopen=()=>{status('Connected','connected');log('HTTP RESPONSE ← 101 Switching Protocols; WebSocket transport established');log('STOMP begins after the HTTP upgrade');send('CONNECT',{'accept-version':'1.2',host:'playground','client-id':'browser-client-ui','heart-beat':`${ms},${ms}`});clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>{if(socket.readyState===1){socket.send('\n');log('CLIENT → SERVER  HEARTBEAT (LF)')}},ms)};socket.onmessage=e=>{if(e.data==='\n'||(e.data instanceof ArrayBuffer&&new TextDecoder().decode(e.data)==='\n')){log('SERVER → CLIENT  HEARTBEAT (LF)');return}const text=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);log('SERVER → CLIENT\n'+text.replace(/\0/g,'<NUL>'));const received=parse(text);if(received.command==='CONNECTED'){send('SUBSCRIBE',{id:'browser-client-sub',destination:$('destination').value,ack:'client-individual','last-sequence':'0'});}else if(received.command==='MESSAGE'){ $('events').textContent=new Date().toLocaleTimeString()+'\nsequence: '+(received.headers.sequence||'')+'\n destination: '+(received.headers.destination||'')+'\n\n'+received.body+'\n\n'+$('events').textContent; send('ACK',{id:received.headers.ack||received.headers['message-id'],subscription:received.headers.subscription,sequence:received.headers.sequence}); }};socket.onerror=()=>{status('Connection error','error');log('connection error')};socket.onclose=()=>{clearInterval(heartbeatTimer);status('Disconnected');log('connection closed')}}
-function disconnect(){clearInterval(heartbeatTimer);if(socket&&socket.readyState===1){send('DISCONNECT');setTimeout(()=>socket.close(1000,'user disconnected'),100)}else status('Disconnected')}
-$('connect').onclick=connect;$('disconnect').onclick=disconnect;
+async function request(path,method='GET',body){const response=await fetch(apiBase+path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});const data=await response.json();if(!response.ok)throw new Error(data.error||'HTTP '+response.status);return data}
+function fillConfig(config){if(loaded)return;const saved=savedSettings();$('url').value=saved.url||config.url;$('heartbeat').value=saved.heartbeat||config.heartbeat;$('log-level').value=saved['log-level']||config.log_level;$('client-id').value=saved['client-id']||config.client_id;$('subscription').value=saved.subscription||config.subscription;$('event-source').value=saved['event-source']||config.event_source;$('username').value=saved.username||config.username||'';updateChannel();loaded=true}
+async function refresh(){try{const current=await request('/status');fillConfig(current.config);const state=current.state;status(state+(current.last_error?' — '+current.last_error:''),state==='connected'?'connected':state==='error'?'error':'');$('client-status').textContent=JSON.stringify(current,null,2);$('random-loss').value=current.simulation.random_ack_loss_percent;const logs=await request('/logs');$('client-logs').textContent=logs.logs.join(NL)||'No client logs yet.';$('client-logs').scrollTop=$('client-logs').scrollHeight}catch(error){status('Application API unavailable','error');$('client-status').textContent=error.message}}
+async function apply(){saveSettings();const username=$('username').value;const password=$('password').value;if(password&&!username){status('Username required','error');log('Password was provided without a username');return}const payload={url:$('url').value.trim(),heartbeat:Number($('heartbeat').value),log_level:$('log-level').value,client_id:$('client-id').value.trim(),subscription:$('subscription').value.trim(),event_source:$('event-source').value.trim(),username};if(password)payload.password=password;try{await request('/config','POST',payload);$('password').value='';log('UI → CLIENT configuration applied; reconnect requested for channel '+channel());await refresh()}catch(error){status('Configuration error','error');log('CLIENT API error: '+error.message)}}
+async function simulate(path,body,label){try{await request('/simulation/'+path,'POST',body);log('UI → CLIENT simulation: '+label);await refresh()}catch(error){status('Simulation error','error');log('CLIENT API error: '+error.message)}}
+async function disconnect(){try{await request('/disconnect','POST');log('UI → CLIENT disconnect requested');await refresh()}catch(error){status('Disconnect error','error');log('CLIENT API error: '+error.message)}}
+for(const id of settingIds)$(id).addEventListener('change',()=>{saveSettings();updateChannel()});
+$('connect').onclick=apply;$('disconnect').onclick=disconnect;
+$('drop-one').onclick=()=>simulate('drop-acks',{count:1},'drop next ACK');
+$('drop-exhaust').onclick=()=>simulate('drop-acks',{count:17},'drop 17 ACKs until server disconnect');
+$('disconnect-next').onclick=()=>simulate('disconnect-next-message',{count:1},'disconnect before next ACK');
+$('close-now').onclick=()=>simulate('close-connection',{},'close active connection');
+$('set-random').onclick=()=>simulate('random-ack-loss',{percent:Number($('random-loss').value)},'set random ACK loss');
+$('reset-sim').onclick=()=>simulate('reset',{},'reset simulations');
+setInterval(refresh,1000);refresh();
 </script></body></html>

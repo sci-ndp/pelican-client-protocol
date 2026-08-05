@@ -42,7 +42,7 @@ async def run(destination: str, rate: float, url: str, state: dict[str, bool]) -
                     if state["paused"]:
                         await asyncio.sleep(0.25)
                         continue
-                    payload = {"uuid": str(uuid.uuid4()), "timestamp": datetime.now(timezone.utc).isoformat(), "random": random.randint(0, 1_000_000), "sequence": "assigned-by-server"}
+                    payload = {"uuid": str(uuid.uuid4()), "timestamp": datetime.now(timezone.utc).isoformat(), "random": random.randint(0, 1_000_000)}
                     await ws.send(frame(destination, payload))
                     await asyncio.sleep(rate)
         except (OSError, websockets.ConnectionClosed) as exc:

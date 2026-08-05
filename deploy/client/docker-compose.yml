@@ -2,16 +2,25 @@ services:
   stomp-client:
     build:
       context: ../../stomp-client
-    command: python client.py --destination ${DESTINATION:-/origin/demo} --client-id ${CLIENT_ID:-remote-client} --reconnect --heartbeat ${HEARTBEAT_MS:-10000}
+    command: python client.py --client-id ${CLIENT_ID:-remote-client} --reconnect --heartbeat ${HEARTBEAT_MS:-10000} --log-level ${LOG_LEVEL:-INFO}
     restart: unless-stopped
     environment:
       # This must be reachable from the client VM, e.g. ws://203.0.113.10:8080.
       STOMP_URL: ${STOMP_URL:?Set STOMP_URL to the server VM WebSocket URL}
       CLIENT_DB: /data/client.sqlite3
+      CLIENT_ID: ${CLIENT_ID:-remote-client}
+      SUBSCRIPTION: ${SUBSCRIPTION:-}
+      EVENT_SOURCE: ${EVENT_SOURCE:-demo-events}
+      STOMP_USERNAME: ${STOMP_USERNAME:-}
+      STOMP_PASSWORD: ${STOMP_PASSWORD:-}
       DROP_ACK_PERCENT: ${DROP_ACK_PERCENT:-0}
       DISCONNECT_AFTER: ${DISCONNECT_AFTER:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_PORT: 8081
     volumes:
       - client-data:/data
+    ports:
+      - "${CLIENT_LOG_PORT:-8081}:8081"
 
   client-ui:
     build:
