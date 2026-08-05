@@ -7,9 +7,14 @@ services:
 
   client:
     build: ./stomp-client
-    command: python client.py --destination /origin/demo --reconnect
+    command: python client.py --destination /origin/demo --client-id playground-client --reconnect
     environment:
       STOMP_URL: ws://server:8080
+      CLIENT_DB: /data/client.sqlite3
+      DROP_ACK_PERCENT: ${DROP_ACK_PERCENT:-0}
+      DISCONNECT_AFTER: ${DISCONNECT_AFTER:-0}
+    volumes:
+      - client-data:/data
     depends_on:
       - server
 
@@ -30,3 +35,6 @@ services:
       - "8000:8000"
     depends_on:
       - server
+
+volumes:
+  client-data:
