@@ -19,6 +19,7 @@ func (a simpleAddr) String() string  { return string(a) }
 func main() {
 	port := flag.String("port", "8080", "port to listen on")
 	debug := flag.Bool("debug", false, "log full frame contents (headers and body) for every frame")
+	htpasswdFile := flag.String("htpasswd", "", "path to an htpasswd file; if absent, connections are unauthenticated")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -27,11 +28,21 @@ func main() {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
+	var authenticator Authenticator = noAuth{}
+	if *htpasswdFile != "" {
+		a, err := newBasicAuth(*htpasswdFile)
+		if err != nil {
+			logger.Error("failed to load htpasswd file", "error", err)
+			os.Exit(1)
+		}
+		authenticator = a
+	}
+
 	addr := ":" + *port
 	listener := newWSListener(simpleAddr(addr))
 
 	mux := http.NewServeMux()
-	mux.Handle("/", listener)
+	mux.Handle("/", requireAuth(authenticator, listener))
 
 	httpServer := &http.Server{Addr: addr, Handler: mux}
 	go func() {
