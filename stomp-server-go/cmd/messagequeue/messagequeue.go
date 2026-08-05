@@ -40,19 +40,14 @@ var defaultMessageQueueConfig = messageQueueConfig{
 // relies on the server's own NACK-triggered redelivery (server.go's
 // handleNack). It is cleared on ack, and replaced fresh (never reused) on
 // every (re)subscribe, so retry state never survives a disconnect the way
-// queue contents do.
+// queue contents do. Unlike clientQueue, it is never persisted -- a
+// *time.Timer can't survive a restart, so this stays in-memory regardless of
+// which clientQueue implementation is in use.
 type inFlightDelivery struct {
 	messageID string // stable across retries; only the ack id changes
 	attempt   int    // retries already attempted; 0 before the first retry
 	delay     time.Duration
 	timer     *time.Timer
-}
-
-// clientQueue is one client's persistent event queue plus whatever delivery
-// is currently in flight for it, if any.
-type clientQueue struct {
-	events   []string // oldest first; events[0] is the oldest un-acked event
-	inFlight *inFlightDelivery
 }
 
 // messageQueueApp is a small application layer built entirely on the
@@ -61,28 +56,33 @@ type clientQueue struct {
 // (keyed by its `subscription` header, surviving reconnects) drained one
 // message at a time with ack-gated, exponentially-backed-off retries.
 type messageQueueApp struct {
-	srv    stomp.StompServer
-	log    *slog.Logger
-	source EventSource
-	cfg    messageQueueConfig
+	srv      stomp.StompServer
+	log      *slog.Logger
+	source   EventSource
+	cfg      messageQueueConfig
+	newQueue queueFactory
 
-	mu     sync.Mutex
-	queues map[string]*clientQueue // client's `subscription` header value -> queue
+	mu        sync.Mutex
+	queues    map[string]clientQueue      // client's `subscription` header value -> queue
+	inFlights map[string]*inFlightDelivery // client's `subscription` header value -> in-flight delivery, if any
 }
 
 // newMessageQueueApp registers itself as a subscriber to srv's SUBSCRIBE and
-// ACK events, starts reading source, and returns the running app.
-func newMessageQueueApp(srv stomp.StompServer, log *slog.Logger, source EventSource) *messageQueueApp {
-	return newMessageQueueAppWithConfig(srv, log, source, defaultMessageQueueConfig)
+// ACK events, starts reading source, and returns the running app. newQueue
+// is called once per distinct client id to create that client's clientQueue.
+func newMessageQueueApp(srv stomp.StompServer, log *slog.Logger, source EventSource, newQueue queueFactory) *messageQueueApp {
+	return newMessageQueueAppWithConfig(srv, log, source, defaultMessageQueueConfig, newQueue)
 }
 
-func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, source EventSource, cfg messageQueueConfig) *messageQueueApp {
+func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, source EventSource, cfg messageQueueConfig, newQueue queueFactory) *messageQueueApp {
 	a := &messageQueueApp{
-		srv:    srv,
-		log:    log,
-		source: source,
-		cfg:    cfg,
-		queues: map[string]*clientQueue{},
+		srv:       srv,
+		log:       log,
+		source:    source,
+		cfg:       cfg,
+		newQueue:  newQueue,
+		queues:    map[string]clientQueue{},
+		inFlights: map[string]*inFlightDelivery{},
 	}
 	srv.OnSubscribe(a.onSubscribe)
 	srv.OnAck(a.onAck)
@@ -91,7 +91,7 @@ func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, sourc
 }
 
 // run is the single goroutine that ever reads from source.Events(); all
-// clientQueue map/slice mutation elsewhere in this file happens either here
+// clientQueue/inFlights mutation elsewhere in this file happens either here
 // or on a connection/timer goroutine, always under a.mu, so there is never a
 // second reader of the same channel to race against.
 func (a *messageQueueApp) run() {
@@ -112,6 +112,17 @@ func (a *messageQueueApp) clientIDFromDestination(destination string) (string, b
 	return strings.TrimSuffix(destination, suffix), true
 }
 
+// clearInFlight stops and forgets clientID's in-flight delivery, if any.
+// Must be called with a.mu held.
+func (a *messageQueueApp) clearInFlight(clientID string) {
+	if inFlight := a.inFlights[clientID]; inFlight != nil {
+		if inFlight.timer != nil {
+			inFlight.timer.Stop()
+		}
+		delete(a.inFlights, clientID)
+	}
+}
+
 // onEvent implements the fan-out and 100-cap policy: while there are no
 // registered queues, new events are dropped; once at least one exists, the
 // event is appended to every queue, capped at cfg.maxQueueLen by dropping the
@@ -128,22 +139,17 @@ func (a *messageQueueApp) onEvent(event string) {
 	var toDisconnect []string
 	var toDeliver []string
 	for clientID, q := range a.queues {
-		q.events = append(q.events, event)
-		overflowed := len(q.events) > a.cfg.maxQueueLen
-		if overflowed {
-			q.events = q.events[len(q.events)-a.cfg.maxQueueLen:]
+		overflowed, err := q.Enqueue(event, a.cfg.maxQueueLen)
+		if err != nil {
+			a.log.Error("queue enqueue failed", "subscription", clientID, "error", err)
+			continue
 		}
 		destination := a.destination(clientID)
 		connected := a.srv.Connected(destination)
 		if overflowed && connected {
-			if q.inFlight != nil {
-				if q.inFlight.timer != nil {
-					q.inFlight.timer.Stop()
-				}
-				q.inFlight = nil
-			}
+			a.clearInFlight(clientID)
 			toDisconnect = append(toDisconnect, destination)
-		} else if q.inFlight == nil && connected {
+		} else if a.inFlights[clientID] == nil && connected {
 			toDeliver = append(toDeliver, clientID)
 		}
 	}
@@ -179,19 +185,20 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	a.mu.Lock()
 	q, existed := a.queues[clientID]
 	if !existed {
-		q = &clientQueue{}
+		q = a.newQueue(clientID)
 		a.queues[clientID] = q
 	}
-	if q.inFlight != nil {
-		if q.inFlight.timer != nil {
-			q.inFlight.timer.Stop()
-		}
-		q.inFlight = nil
-	}
+	a.clearInFlight(clientID)
 	a.mu.Unlock()
 
-	if existed {
-		a.log.Info("resumed existing event queue", "subscription", clientID)
+	// existed only tracks whether this process has already built an
+	// in-process handle for clientID; a durable queue (e.g. sqliteClientQueue)
+	// may have events from a prior process run before this one ever saw
+	// clientID, so ask the queue itself whether there's anything to resume.
+	if n, err := q.Len(); err != nil {
+		a.log.Warn("queue length check failed", "subscription", clientID, "error", err)
+	} else if existed || n > 0 {
+		a.log.Info("resumed existing event queue", "subscription", clientID, "queued", n)
 	} else {
 		a.log.Info("created new event queue", "subscription", clientID)
 	}
@@ -203,13 +210,22 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 func (a *messageQueueApp) tryDeliver(clientID string) {
 	a.mu.Lock()
 	q, ok := a.queues[clientID]
-	if !ok || len(q.events) == 0 || q.inFlight != nil {
+	if !ok || a.inFlights[clientID] != nil {
+		a.mu.Unlock()
+		return
+	}
+	body, hasEvent, err := q.PeekFront()
+	if err != nil {
+		a.mu.Unlock()
+		a.log.Error("queue peek failed", "subscription", clientID, "error", err)
+		return
+	}
+	if !hasEvent {
 		a.mu.Unlock()
 		return
 	}
 	inFlight := &inFlightDelivery{messageID: uuid.NewString(), delay: a.cfg.initialRetryDelay}
-	q.inFlight = inFlight
-	body := q.events[0]
+	a.inFlights[clientID] = inFlight
 	a.mu.Unlock()
 
 	a.sendAndArm(clientID, body, inFlight)
@@ -239,12 +255,12 @@ func (a *messageQueueApp) sendAndArm(clientID, body string, inFlight *inFlightDe
 func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDelivery) {
 	a.mu.Lock()
 	q, ok := a.queues[clientID]
-	if !ok || q.inFlight != inFlight {
+	if !ok || a.inFlights[clientID] != inFlight {
 		a.mu.Unlock()
 		return // superseded by an ack or a fresh resubscribe; ignore
 	}
 	if inFlight.attempt >= a.cfg.maxRetries {
-		q.inFlight = nil
+		delete(a.inFlights, clientID)
 		a.mu.Unlock()
 		destination := a.destination(clientID)
 		a.log.Warn("retry budget exhausted; disconnecting client", "subscription", clientID, "destination", destination)
@@ -255,8 +271,15 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 	}
 	inFlight.attempt++
 	inFlight.delay = time.Duration(float64(inFlight.delay) * a.cfg.retryBackoffFactor)
-	body := q.events[0]
+	body, hasEvent, err := q.PeekFront()
 	a.mu.Unlock()
+	if err != nil {
+		a.log.Error("queue peek failed", "subscription", clientID, "error", err)
+		return
+	}
+	if !hasEvent {
+		return
+	}
 
 	a.sendAndArm(clientID, body, inFlight)
 }
@@ -274,19 +297,25 @@ func (a *messageQueueApp) onAck(headers map[string]string) {
 
 	a.mu.Lock()
 	q, ok := a.queues[clientID]
-	if !ok || q.inFlight == nil || q.inFlight.messageID != messageID {
+	inFlight := a.inFlights[clientID]
+	if !ok || inFlight == nil || inFlight.messageID != messageID {
 		a.mu.Unlock()
 		return
 	}
-	if q.inFlight.timer != nil {
-		q.inFlight.timer.Stop()
+	a.clearInFlight(clientID)
+	if err := q.PopFront(); err != nil {
+		a.mu.Unlock()
+		a.log.Error("queue pop failed", "subscription", clientID, "error", err)
+		return
 	}
-	q.inFlight = nil
-	q.events = q.events[1:]
-	hasMore := len(q.events) > 0
+	remaining, err := q.Len()
 	a.mu.Unlock()
+	if err != nil {
+		a.log.Error("queue length check failed", "subscription", clientID, "error", err)
+		return
+	}
 
-	if hasMore {
+	if remaining > 0 {
 		a.tryDeliver(clientID)
 	}
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -107,8 +108,20 @@ func (f *fakeEventSource) Events() <-chan string { return f.ch }
 func newTestApp(cfg messageQueueConfig) (*messageQueueApp, *fakeStompServer) {
 	srv := newFakeStompServer()
 	source := newFakeEventSource("testsource")
-	app := newMessageQueueAppWithConfig(srv, discardLogger(), source, cfg)
+	app := newMessageQueueAppWithConfig(srv, discardLogger(), source, cfg, newMemoryClientQueue)
 	return app, srv
+}
+
+// queueEvents reads out a memoryClientQueue's contents for assertions. All
+// tests in this file use newMemoryClientQueue as their queueFactory, so this
+// type assertion is safe.
+func queueEvents(t *testing.T, q clientQueue) []string {
+	t.Helper()
+	mq, ok := q.(*memoryClientQueue)
+	if !ok {
+		t.Fatalf("expected a *memoryClientQueue, got %T", q)
+	}
+	return append([]string{}, mq.events...)
 }
 
 func subscribeHeaders(clientID string) map[string]string {
@@ -197,8 +210,8 @@ func TestOnSubscribe_ResumesExistingQueueAcrossReconnect(t *testing.T) {
 
 	app.mu.Lock()
 	resumedQueue := app.queues["bob"]
-	events := append([]string{}, resumedQueue.events...)
 	app.mu.Unlock()
+	events := queueEvents(t, resumedQueue)
 
 	if resumedQueue != originalQueue {
 		t.Error("resubscribing with the same subscription header created a new queue instead of resuming it")
@@ -233,9 +246,9 @@ func TestOnEvent_DisconnectsConnectedClientOnOverflow(t *testing.T) {
 
 	app.mu.Lock()
 	q := app.queues["alice"]
-	events := append([]string{}, q.events...)
-	inFlight := q.inFlight
+	inFlight := app.inFlights["alice"]
 	app.mu.Unlock()
+	events := queueEvents(t, q)
 
 	want := []string{"E2", "E3", "E4"}
 	if len(events) != len(want) {
@@ -275,8 +288,9 @@ func TestOnEvent_TrimsWithoutDisconnectingWhenOffline(t *testing.T) {
 	}
 
 	app.mu.Lock()
-	events := append([]string{}, app.queues["alice"].events...)
+	q := app.queues["alice"]
 	app.mu.Unlock()
+	events := queueEvents(t, q)
 
 	want := []string{"E2", "E3", "E4"}
 	if len(events) != len(want) {
@@ -327,7 +341,7 @@ func TestOnRetryTimeout_BacksOffThenGivesUpAndDisconnects(t *testing.T) {
 	}
 
 	app.mu.Lock()
-	inFlight := app.queues["alice"].inFlight
+	inFlight := app.inFlights["alice"]
 	app.mu.Unlock()
 	if inFlight != nil {
 		t.Error("inFlight should be cleared after retry exhaustion")
@@ -342,7 +356,7 @@ func TestOnAck_IgnoresMismatchedOrUnknownAck(t *testing.T) {
 	app.onEvent("Event 1")
 
 	app.mu.Lock()
-	originalInFlight := app.queues["alice"].inFlight
+	originalInFlight := app.inFlights["alice"]
 	app.mu.Unlock()
 
 	// Ack for a message id that doesn't match the current in-flight delivery.
@@ -352,9 +366,9 @@ func TestOnAck_IgnoresMismatchedOrUnknownAck(t *testing.T) {
 
 	app.mu.Lock()
 	q := app.queues["alice"]
-	inFlight := q.inFlight
-	events := append([]string{}, q.events...)
+	inFlight := app.inFlights["alice"]
 	app.mu.Unlock()
+	events := queueEvents(t, q)
 
 	if inFlight != originalInFlight {
 		t.Error("a mismatched ack should not clear the in-flight delivery")
@@ -364,5 +378,45 @@ func TestOnAck_IgnoresMismatchedOrUnknownAck(t *testing.T) {
 	}
 	if len(srv.snapshotPublishes()) != 1 {
 		t.Error("a mismatched ack should not trigger another delivery")
+	}
+}
+
+func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "queue.sqlite3")
+
+	db1, err := openQueueDB(dbPath)
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	srv1 := newFakeStompServer()
+	srv1.setConnected("carol/testsource", true)
+	app1 := newMessageQueueAppWithConfig(srv1, discardLogger(), newFakeEventSource("testsource"), defaultMessageQueueConfig, sqliteQueueFactory(db1))
+	app1.onSubscribe(subscribeHeaders("carol"))
+	app1.onEvent("Event 1") // delivered but never acked
+	if got := srv1.snapshotPublishes(); len(got) != 1 {
+		t.Fatalf("Publish calls before restart = %d, want 1: %+v", len(got), got)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close db1: %v", err)
+	}
+
+	// Simulate a full process restart: a brand-new app and server, backed by
+	// the same on-disk database file.
+	db2, err := openQueueDB(dbPath)
+	if err != nil {
+		t.Fatalf("reopen openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db2.Close() })
+	srv2 := newFakeStompServer()
+	srv2.setConnected("carol/testsource", true)
+	app2 := newMessageQueueAppWithConfig(srv2, discardLogger(), newFakeEventSource("testsource"), defaultMessageQueueConfig, sqliteQueueFactory(db2))
+	app2.onSubscribe(subscribeHeaders("carol"))
+
+	publishes := srv2.snapshotPublishes()
+	if len(publishes) != 1 {
+		t.Fatalf("Publish calls after restart = %d, want 1 (resumed delivery of the pre-restart event)", len(publishes))
+	}
+	if publishes[0].body != "Event 1" {
+		t.Errorf("resumed body = %q, want %q", publishes[0].body, "Event 1")
 	}
 }

@@ -45,7 +45,7 @@ func TestSmokeEndToEnd(t *testing.T) {
 	defer listener.Close()
 
 	source := newTickerEventSource("demo-events", 100*time.Millisecond)
-	newMessageQueueApp(srv, discardLogger(), source)
+	newMessageQueueApp(srv, discardLogger(), source, newMemoryClientQueue)
 
 	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
 	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)

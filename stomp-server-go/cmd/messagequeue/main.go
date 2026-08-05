@@ -16,6 +16,7 @@ func main() {
 	port := flag.String("port", "8080", "port to listen on")
 	debug := flag.Bool("debug", false, "log full frame contents (headers and body) for every frame")
 	htpasswdFile := flag.String("htpasswd", "", "path to an htpasswd file; if absent, connections are unauthenticated")
+	queueDB := flag.String("queue-db", "", "path to a SQLite database file for durable, on-disk client queues; if absent, queues are kept in memory only")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -49,9 +50,22 @@ func main() {
 		}
 	}()
 
+	newQueue := queueFactory(newMemoryClientQueue)
+	if *queueDB != "" {
+		db, err := openQueueDB(*queueDB)
+		if err != nil {
+			logger.Error("failed to open queue database", "error", err)
+			os.Exit(1)
+		}
+		newQueue = sqliteQueueFactory(db)
+		logger.Info("using on-disk client queues", "queue-db", *queueDB)
+	} else {
+		logger.Info("using in-memory client queues")
+	}
+
 	srv := stomp.NewServer(logger)
 	source := newTickerEventSource("demo-events", eventInterval)
-	newMessageQueueApp(srv, logger, source)
+	newMessageQueueApp(srv, logger, source, newQueue)
 	if err := srv.Serve(listener); err != nil {
 		logger.Error("stomp server failed", "error", err)
 		os.Exit(1)
