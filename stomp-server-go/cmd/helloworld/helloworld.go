@@ -59,7 +59,7 @@ func (a *helloWorldApp) broadcastLoop(destination string) {
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		if err := a.srv.Publish(destination, "Hello, World"); err != nil {
+		if err := a.srv.Publish(destination, "", "Hello, World"); err != nil {
 			a.log.Error("failed to publish hello-world message", "destination", destination, "error", err)
 		}
 	}

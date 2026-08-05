@@ -78,6 +78,7 @@ type Server struct {
 	subscriptions map[string]map[net.Conn]bool // destination -> set of subscribed conns
 	log           *slog.Logger
 	onSubscribe   []func(headers map[string]string)
+	onAck         []func(headers map[string]string)
 }
 
 func NewServer(log *slog.Logger) *Server {
@@ -94,8 +95,9 @@ func NewServer(log *slog.Logger) *Server {
 // never reaches into Server's internal session/subscription bookkeeping.
 type StompServer interface {
 	// Publish delivers body, JSON-encoded, as a MESSAGE to every session
-	// currently subscribed to destination.
-	Publish(destination string, body any) error
+	// currently subscribed to destination. If messageID is empty, one is
+	// generated.
+	Publish(destination string, messageID string, body any) error
 
 	// OnSubscribe registers fn to be called after every successful
 	// SUBSCRIBE, with the full SUBSCRIBE frame's headers (destination, id,
@@ -104,6 +106,25 @@ type StompServer interface {
 	// synchronously on the subscribing client's connection goroutine, so
 	// it must not block or call back into the server while holding a lock.
 	OnSubscribe(fn func(headers map[string]string))
+
+	// OnAck registers fn to be called once for every pending message this
+	// server resolves via a client's ACK. A single cumulative ack:client ACK
+	// can resolve more than one message; fn is called once per message
+	// resolved. fn receives a headers map mirroring the resolved MESSAGE's
+	// fields: "destination", "message-id", "subscription" (the SUBSCRIBE's
+	// id header), and "ack" (the ack id the client just acknowledged). fn
+	// runs synchronously on the acking client's connection goroutine, so
+	// (like OnSubscribe) it must not block or call back into the server
+	// while holding a lock.
+	OnAck(fn func(headers map[string]string))
+
+	// Disconnect closes every session currently subscribed to destination.
+	// It is a no-op if none is.
+	Disconnect(destination string) error
+
+	// Connected reports whether any session is currently subscribed to
+	// destination.
+	Connected(destination string) bool
 }
 
 var _ StompServer = (*Server)(nil)
@@ -113,6 +134,41 @@ func (s *Server) OnSubscribe(fn func(headers map[string]string)) {
 	s.mu.Lock()
 	s.onSubscribe = append(s.onSubscribe, fn)
 	s.mu.Unlock()
+}
+
+// OnAck implements StompServer.
+func (s *Server) OnAck(fn func(headers map[string]string)) {
+	s.mu.Lock()
+	s.onAck = append(s.onAck, fn)
+	s.mu.Unlock()
+}
+
+// Disconnect implements StompServer. Closing conn unblocks that
+// connection's blocked read in handleConn's reader goroutine, which drives
+// handleConn's own deferred cleanup (removing it from sessions and
+// subscriptions) the same way any other disconnect does.
+func (s *Server) Disconnect(destination string) error {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.subscriptions[destination]))
+	for conn := range s.subscriptions[destination] {
+		conns = append(conns, conn)
+	}
+	s.mu.Unlock()
+
+	var errs []error
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Connected implements StompServer.
+func (s *Server) Connected(destination string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.subscriptions[destination]) > 0
 }
 
 // frameDump renders a frame's wire format for logging, with the NUL
@@ -295,7 +351,7 @@ func (s *Server) handleSend(sess *session, frame *Frame) error {
 	if err := json.Unmarshal([]byte(frame.Body), &body); err != nil {
 		body = map[string]any{"value": frame.Body}
 	}
-	return s.Publish(destination, body)
+	return s.Publish(destination, "", body)
 }
 
 // delivery is a MESSAGE frame ready to send, prepared while s.mu was held.
@@ -305,12 +361,14 @@ type delivery struct {
 }
 
 // Publish implements StompServer.
-func (s *Server) Publish(destination string, body any) error {
+func (s *Server) Publish(destination string, messageID string, body any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	messageID := uuid.NewString()
+	if messageID == "" {
+		messageID = uuid.NewString()
+	}
 
 	s.mu.Lock()
 	var deliveries []delivery
@@ -404,8 +462,21 @@ func (s *Server) handleAck(sess *session, frame *Frame) error {
 		s.mu.Unlock()
 		return protocolErrorf("unknown ack id: %s", ackID)
 	}
-	resolve(sess, sess.subscriptions[subID], ackID)
+	resolved := resolve(sess, sess.subscriptions[subID], ackID)
+	callbacks := append([]func(map[string]string){}, s.onAck...)
 	s.mu.Unlock()
+
+	for _, r := range resolved {
+		headers := map[string]string{
+			"destination":  r.info.destination,
+			"message-id":   r.info.messageID,
+			"subscription": subID,
+			"ack":          r.ackID,
+		}
+		for _, cb := range callbacks {
+			cb(headers)
+		}
+	}
 
 	if receipt := frame.Headers["receipt"]; receipt != "" {
 		return s.send(sess, NewFrame("RECEIPT", map[string]string{"receipt-id": receipt}, ""))

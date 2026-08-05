@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,8 +15,10 @@ import (
 
 // startTestServer brings up a Server (server.go) fed by a wsListener behind
 // an httptest.Server, exactly as main.go wires them together, and returns
-// the ws:// URL clients should dial. Everything is torn down via t.Cleanup.
-func startTestServer(t *testing.T, authenticator Authenticator) string {
+// the ws:// URL clients should dial along with the Server itself, so tests
+// can register callbacks (OnAck, OnSubscribe) or call Disconnect/Connected
+// directly. Everything is torn down via t.Cleanup.
+func startTestServer(t *testing.T, authenticator Authenticator) (string, *Server) {
 	t.Helper()
 
 	listener := NewWSListener(SimpleAddr("test"))
@@ -29,7 +32,7 @@ func startTestServer(t *testing.T, authenticator Authenticator) string {
 	go srv.Serve(listener)
 	t.Cleanup(func() { listener.Close() })
 
-	return "ws" + strings.TrimPrefix(httpServer.URL, "http")
+	return "ws" + strings.TrimPrefix(httpServer.URL, "http"), srv
 }
 
 // discardStompLogger is a stomp.Logger that drops everything, so a test's
@@ -83,7 +86,7 @@ func recvMessage(t *testing.T, sub *stomp.Subscription) *stomp.Message {
 }
 
 func TestIntegration_ConnectAndDisconnect(t *testing.T) {
-	wsURL := startTestServer(t, NoAuth{})
+	wsURL, _ := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)
 
 	if conn.Version() != stomp.V12 {
@@ -98,7 +101,7 @@ func TestIntegration_ConnectAndDisconnect(t *testing.T) {
 }
 
 func TestIntegration_PublishSubscribeAutoAck(t *testing.T) {
-	wsURL := startTestServer(t, NoAuth{})
+	wsURL, _ := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
@@ -124,7 +127,7 @@ func TestIntegration_PublishSubscribeAutoAck(t *testing.T) {
 }
 
 func TestIntegration_ClientIndividualAckAndNackRedelivery(t *testing.T) {
-	wsURL := startTestServer(t, NoAuth{})
+	wsURL, _ := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckClientIndividual)
@@ -174,7 +177,7 @@ func TestIntegration_BasicAuthRejectsMissingCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBasicAuth: %v", err)
 	}
-	wsURL := startTestServer(t, authenticator)
+	wsURL, _ := startTestServer(t, authenticator)
 
 	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err == nil {
@@ -191,7 +194,7 @@ func TestIntegration_BasicAuthAcceptsCorrectCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBasicAuth: %v", err)
 	}
-	wsURL := startTestServer(t, authenticator)
+	wsURL, _ := startTestServer(t, authenticator)
 
 	header := http.Header{}
 	header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("alice:s3cret")))
@@ -200,4 +203,157 @@ func TestIntegration_BasicAuthAcceptsCorrectCredentials(t *testing.T) {
 	if conn.Version() != stomp.V12 {
 		t.Errorf("Version() = %v, want %v", conn.Version(), stomp.V12)
 	}
+}
+
+func TestIntegration_OnAckFiresWithExpectedHeaders(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	acked := make(chan map[string]string, 1)
+	srv.OnAck(func(headers map[string]string) { acked <- headers })
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckClientIndividual)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := conn.Send("/topic/test", "application/json", []byte(`{"n":1}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	msg := recvMessage(t, sub)
+	if err := conn.Ack(msg); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	select {
+	case headers := <-acked:
+		if headers["destination"] != "/topic/test" {
+			t.Errorf("destination = %q, want %q", headers["destination"], "/topic/test")
+		}
+		if headers["message-id"] != msg.Header.Get("message-id") {
+			t.Errorf("message-id = %q, want %q", headers["message-id"], msg.Header.Get("message-id"))
+		}
+		if headers["ack"] != msg.Header.Get("ack") {
+			t.Errorf("ack = %q, want %q", headers["ack"], msg.Header.Get("ack"))
+		}
+		if headers["subscription"] == "" {
+			t.Error("subscription header is empty, want the SUBSCRIBE's id")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for OnAck callback")
+	}
+}
+
+func TestIntegration_OnAckFiresOncePerMessageOnCumulativeAck(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	var mu sync.Mutex
+	var acked []string
+	done := make(chan struct{})
+	srv.OnAck(func(headers map[string]string) {
+		mu.Lock()
+		acked = append(acked, headers["message-id"])
+		if len(acked) == 2 {
+			close(done)
+		}
+		mu.Unlock()
+	})
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckClient)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := conn.Send("/topic/test", "application/json", []byte(`{"n":1}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := conn.Send("/topic/test", "application/json", []byte(`{"n":2}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	first := recvMessage(t, sub)
+	second := recvMessage(t, sub)
+	if err := conn.Ack(second); err != nil { // cumulative: resolves both first and second
+		t.Fatalf("Ack: %v", err)
+	}
+
+	select {
+	case <-done:
+		mu.Lock()
+		defer mu.Unlock()
+		if len(acked) != 2 {
+			t.Fatalf("OnAck fired %d times, want 2: %v", len(acked), acked)
+		}
+		want := []string{first.Header.Get("message-id"), second.Header.Get("message-id")}
+		if acked[0] != want[0] || acked[1] != want[1] {
+			t.Errorf("acked message-ids = %v, want %v", acked, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for both OnAck callbacks")
+	}
+}
+
+func TestIntegration_DisconnectClosesSubscribedConnection(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	if err := srv.Disconnect("/topic/test"); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !srv.Connected("/topic/test") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("Connected(\"/topic/test\") stayed true after Disconnect")
+}
+
+func TestIntegration_DisconnectNoOpWhenNobodySubscribed(t *testing.T) {
+	_, srv := startTestServer(t, NoAuth{})
+	if err := srv.Disconnect("/topic/nobody-here"); err != nil {
+		t.Errorf("Disconnect on an unsubscribed destination: %v, want nil", err)
+	}
+}
+
+func TestIntegration_ConnectedReflectsSubscriptionState(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+
+	if srv.Connected("/topic/test") {
+		t.Fatal("Connected(\"/topic/test\") = true before any subscription")
+	}
+
+	conn := dialStompClient(t, wsURL, nil)
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// SUBSCRIBE is processed asynchronously on the server's connection
+	// goroutine, so Connected may not reflect it the instant Subscribe returns.
+	deadline := time.Now().Add(2 * time.Second)
+	for !srv.Connected("/topic/test") {
+		if time.Now().After(deadline) {
+			t.Fatal("Connected(\"/topic/test\") stayed false after subscribing")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := conn.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	disconnectDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(disconnectDeadline) {
+		if !srv.Connected("/topic/test") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("Connected(\"/topic/test\") stayed true after the client disconnected")
 }
