@@ -54,6 +54,7 @@ func main() {
 	}()
 
 	srv := newServer(logger)
+	newHelloWorldApp(srv, logger)
 	if err := srv.Serve(listener); err != nil {
 		logger.Error("stomp server failed", "error", err)
 		os.Exit(1)

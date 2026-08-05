@@ -77,6 +77,7 @@ type Server struct {
 	sessions      map[net.Conn]*session
 	subscriptions map[string]map[net.Conn]bool // destination -> set of subscribed conns
 	log           *slog.Logger
+	onSubscribe   []func(headers map[string]string)
 }
 
 func newServer(log *slog.Logger) *Server {
@@ -85,6 +86,33 @@ func newServer(log *slog.Logger) *Server {
 		subscriptions: map[string]map[net.Conn]bool{},
 		log:           log,
 	}
+}
+
+// StompServer is the surface an application layer built on top of this
+// STOMP server is allowed to depend on: publishing to a destination, and
+// reacting to subscriptions. It exists so that code like helloworld.go
+// never reaches into Server's internal session/subscription bookkeeping.
+type StompServer interface {
+	// Publish delivers body, JSON-encoded, as a MESSAGE to every session
+	// currently subscribed to destination.
+	Publish(destination string, body any) error
+
+	// OnSubscribe registers fn to be called after every successful
+	// SUBSCRIBE, with the full SUBSCRIBE frame's headers (destination, id,
+	// ack, and any custom headers a client sent) so callers aren't limited
+	// to whatever fields this server happens to pass through today. fn runs
+	// synchronously on the subscribing client's connection goroutine, so
+	// it must not block or call back into the server while holding a lock.
+	OnSubscribe(fn func(headers map[string]string))
+}
+
+var _ StompServer = (*Server)(nil)
+
+// OnSubscribe implements StompServer.
+func (s *Server) OnSubscribe(fn func(headers map[string]string)) {
+	s.mu.Lock()
+	s.onSubscribe = append(s.onSubscribe, fn)
+	s.mu.Unlock()
 }
 
 // frameDump renders a frame's wire format for logging, with the NUL
@@ -245,7 +273,12 @@ func (s *Server) handleSubscribe(sess *session, frame *Frame) error {
 		s.subscriptions[destination] = map[net.Conn]bool{}
 	}
 	s.subscriptions[destination][sess.conn] = true
+	callbacks := append([]func(map[string]string){}, s.onSubscribe...)
 	s.mu.Unlock()
+
+	for _, cb := range callbacks {
+		cb(frame.Headers)
+	}
 
 	if receipt := frame.Headers["receipt"]; receipt != "" {
 		return s.send(sess, NewFrame("RECEIPT", map[string]string{"receipt-id": receipt}, ""))
@@ -262,7 +295,7 @@ func (s *Server) handleSend(sess *session, frame *Frame) error {
 	if err := json.Unmarshal([]byte(frame.Body), &body); err != nil {
 		body = map[string]any{"value": frame.Body}
 	}
-	return s.publishEvent(destination, body)
+	return s.Publish(destination, body)
 }
 
 // delivery is a MESSAGE frame ready to send, prepared while s.mu was held.
@@ -271,7 +304,8 @@ type delivery struct {
 	frame *Frame
 }
 
-func (s *Server) publishEvent(destination string, body any) error {
+// Publish implements StompServer.
+func (s *Server) Publish(destination string, body any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return err
