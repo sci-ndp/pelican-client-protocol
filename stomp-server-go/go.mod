@@ -7,4 +7,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 )
 
-require golang.org/x/crypto v0.45.0
+require (
+	github.com/go-stomp/stomp/v3 v3.1.5
+	golang.org/x/crypto v0.45.0
+)
