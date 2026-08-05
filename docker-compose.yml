@@ -7,12 +7,13 @@ services:
 
   client:
     build: ./stomp-client
-    command: python client.py --destination /origin/demo --client-id playground-client --reconnect
+    command: python client.py --destination /origin/demo --client-id playground-client --reconnect --log-level ${LOG_LEVEL:-INFO}
     environment:
       STOMP_URL: ws://server:8080
       CLIENT_DB: /data/client.sqlite3
       DROP_ACK_PERCENT: ${DROP_ACK_PERCENT:-0}
       DISCONNECT_AFTER: ${DISCONNECT_AFTER:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - client-data:/data
     depends_on:

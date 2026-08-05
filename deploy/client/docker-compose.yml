@@ -2,7 +2,7 @@ services:
   stomp-client:
     build:
       context: ../../stomp-client
-    command: python client.py --destination ${DESTINATION:-/origin/demo} --client-id ${CLIENT_ID:-remote-client} --reconnect --heartbeat ${HEARTBEAT_MS:-10000}
+    command: python client.py --destination ${DESTINATION:-/origin/demo} --client-id ${CLIENT_ID:-remote-client} --reconnect --heartbeat ${HEARTBEAT_MS:-10000} --log-level ${LOG_LEVEL:-INFO}
     restart: unless-stopped
     environment:
       # This must be reachable from the client VM, e.g. ws://203.0.113.10:8080.
@@ -11,6 +11,7 @@ services:
       CLIENT_ID: ${CLIENT_ID:-remote-client}
       DROP_ACK_PERCENT: ${DROP_ACK_PERCENT:-0}
       DISCONNECT_AFTER: ${DISCONNECT_AFTER:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - client-data:/data
 
