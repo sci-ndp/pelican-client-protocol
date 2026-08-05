@@ -108,8 +108,9 @@ class StompClient:
             if connected.command != "CONNECTED":
                 raise RuntimeError(f"expected CONNECTED, got {connected.command}")
             self.log.info("STOMP session established headers=%s", connected.headers)
-            await self.send(ws, Frame("SUBSCRIBE", {"id": "sub-0", "destination": self.args.destination, "ack": "client-individual"}))
-            self.log.info("subscription active id=sub-0 destination=%s ack_mode=client-individual", self.args.destination)
+            subscription_id = f"{self.args.client_id}-sub"
+            await self.send(ws, Frame("SUBSCRIBE", {"id": subscription_id, "destination": self.args.destination, "ack": "client-individual"}))
+            self.log.info("subscription active id=%s destination=%s ack_mode=client-individual", subscription_id, self.args.destination)
             while True:
                 frame = await self.receive(ws)
                 if frame.command == "MESSAGE": await self.on_message(ws, frame)
