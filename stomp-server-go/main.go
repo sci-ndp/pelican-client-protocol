@@ -2,8 +2,9 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 )
 
 // simpleAddr is a minimal net.Addr for wsListener.Addr(); our Server.Serve
@@ -17,7 +18,14 @@ func (a simpleAddr) String() string  { return string(a) }
 
 func main() {
 	port := flag.String("port", "8080", "port to listen on")
+	debug := flag.Bool("debug", false, "log full frame contents (headers and body) for every frame")
 	flag.Parse()
+
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	addr := ":" + *port
 	listener := newWSListener(simpleAddr(addr))
@@ -27,14 +35,16 @@ func main() {
 
 	httpServer := &http.Server{Addr: addr, Handler: mux}
 	go func() {
-		log.Printf("STOMP 1.2 WebSocket server listening on ws://0.0.0.0%s", addr)
+		logger.Info("STOMP 1.2 WebSocket server listening", "addr", "ws://0.0.0.0"+addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http server failed: %v", err)
+			logger.Error("http server failed", "error", err)
+			os.Exit(1)
 		}
 	}()
 
-	srv := newServer()
+	srv := newServer(logger)
 	if err := srv.Serve(listener); err != nil {
-		log.Fatalf("stomp server failed: %v", err)
+		logger.Error("stomp server failed", "error", err)
+		os.Exit(1)
 	}
 }

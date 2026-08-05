@@ -3,8 +3,9 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,13 +76,21 @@ type Server struct {
 	mu            sync.Mutex
 	sessions      map[net.Conn]*session
 	subscriptions map[string]map[net.Conn]bool // destination -> set of subscribed conns
+	log           *slog.Logger
 }
 
-func newServer() *Server {
+func newServer(log *slog.Logger) *Server {
 	return &Server{
 		sessions:      map[net.Conn]*session{},
 		subscriptions: map[string]map[net.Conn]bool{},
+		log:           log,
 	}
+}
+
+// frameDump renders a frame's wire format for logging, with the NUL
+// terminator spelled out so it's visible in a terminal.
+func frameDump(frame *Frame) string {
+	return strings.ReplaceAll(string(frame.Encode()), "\x00", "<NUL>")
 }
 
 // Serve accepts connections from l and handles each on its own goroutine,
@@ -97,7 +106,7 @@ func (s *Server) Serve(l net.Listener) error {
 }
 
 func (s *Server) handleConn(conn net.Conn) {
-	log.Println("HTTP Upgrade accepted; WebSocket transport established")
+	s.log.Info("HTTP Upgrade accepted; WebSocket transport established")
 	sess := newSession(conn)
 	s.mu.Lock()
 	s.sessions[conn] = sess
@@ -118,33 +127,57 @@ func (s *Server) handleConn(conn net.Conn) {
 		conn.Close()
 	}()
 
-	for {
-		conn.SetReadDeadline(time.Now().Add(readTimeout))
-		frame, err := readFrame(conn)
-		if err != nil {
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				if err := s.sendBytes(sess, []byte("\n")); err != nil {
-					return
-				}
-				continue
+	// gorilla/websocket's Conn treats every error NextReader returns --
+	// including a plain read-deadline timeout -- as permanent: once one
+	// occurs, every later ReadMessage call replays it without doing any I/O,
+	// eventually panicking ("repeated read on failed websocket connection").
+	// So the read loop below may never retry a read after an error; the
+	// periodic idle heartbeat instead runs on a ticker in a separate
+	// goroutine, fed by one single, un-retried blocking read.
+	frames := make(chan *Frame, 1)
+	readErrs := make(chan error, 1)
+	go func() {
+		for {
+			frame, err := readFrame(conn)
+			if err != nil {
+				readErrs <- err
+				return
 			}
+			frames <- frame
+		}
+	}()
+
+	ticker := time.NewTicker(readTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := s.sendBytes(sess, []byte("\n")); err != nil {
+				return
+			}
+			s.log.Debug("SERVER -> CLIENT", "command", "HEARTBEAT")
+
+		case err := <-readErrs:
 			var protoErr *ProtocolError
 			if errors.As(err, &protoErr) {
 				s.send(sess, NewFrame("ERROR", map[string]string{"message": protoErr.Error()}, protoErr.Error()))
-				return
 			}
-			// connection closed, or some other I/O error: clean up via defer
+			// otherwise: connection closed, or some other I/O error; clean up via defer
 			return
-		}
 
-		if frame.Command == "HEARTBEAT" {
-			continue
-		}
-		log.Printf("CLIENT -> SERVER  %s", frame.Command)
-		if err := s.dispatch(sess, frame); err != nil {
-			log.Printf("command failed: %v", err)
-			s.send(sess, NewFrame("ERROR", map[string]string{"message": err.Error()}, err.Error()))
+		case frame := <-frames:
+			ticker.Reset(readTimeout)
+			if frame.Command == "HEARTBEAT" {
+				s.log.Debug("CLIENT -> SERVER", "command", "HEARTBEAT")
+				continue
+			}
+			s.log.Info("CLIENT -> SERVER", "command", frame.Command)
+			s.log.Debug("CLIENT -> SERVER", "frame", frameDump(frame))
+			if err := s.dispatch(sess, frame); err != nil {
+				s.log.Error("command failed", "error", err)
+				s.send(sess, NewFrame("ERROR", map[string]string{"message": err.Error()}, err.Error()))
+			}
 		}
 	}
 }
@@ -159,7 +192,8 @@ func (s *Server) sendBytes(sess *session, data []byte) error {
 func (s *Server) send(sess *session, frame *Frame) error {
 	err := s.sendBytes(sess, frame.Encode())
 	if err == nil {
-		log.Printf("SERVER -> CLIENT  %s", frame.Command)
+		s.log.Info("SERVER -> CLIENT", "command", frame.Command)
+		s.log.Debug("SERVER -> CLIENT", "frame", frameDump(frame))
 	}
 	return err
 }
@@ -262,7 +296,7 @@ func (s *Server) publishEvent(destination string, body any) error {
 
 	for _, d := range deliveries {
 		if err := s.send(d.sess, d.frame); err != nil {
-			log.Printf("failed to deliver MESSAGE: %v", err)
+			s.log.Error("failed to deliver MESSAGE", "error", err)
 		}
 	}
 	return nil
@@ -363,7 +397,7 @@ func (s *Server) handleNack(sess *session, frame *Frame) error {
 	var redeliveries []*Frame
 	for _, r := range resolved {
 		if r.info.attempts >= 1 {
-			log.Printf("dropping message-id=%s after redelivery was also nacked", r.info.messageID)
+			s.log.Warn("dropping message after redelivery was also nacked", "message_id", r.info.messageID)
 			continue
 		}
 		redeliveries = append(redeliveries, s.prepareDelivery(subID, sess, sub, r.info.messageID, r.info.destination, r.info.body, r.info.attempts+1))
