@@ -14,8 +14,11 @@ services:
       DROP_ACK_PERCENT: ${DROP_ACK_PERCENT:-0}
       DISCONNECT_AFTER: ${DISCONNECT_AFTER:-0}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_PORT: 8081
     volumes:
       - client-data:/data
+    ports:
+      - "8081:8081"
     depends_on:
       - server
 
