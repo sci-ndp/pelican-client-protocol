@@ -27,7 +27,8 @@
   <p>Browser subscriber for the Docker playground. Events come from the WebSocket server and are ACKed or NACKed by this page.</p>
   <section class="toolbar">
     <label>WebSocket URL <input id="url" value="ws://localhost:8080"></label>
-    <label>Destination <input id="destination" value="/origin/demo"></label>
+    <label>Subscription ID <input id="subscription" value="browser-subscription"></label>
+    <label>Destination <input id="destination" value="browser-subscription/demo-events"></label>
     <label>Ack mode <select id="ackmode"><option value="client-individual" selected>client-individual</option><option value="client">client (cumulative)</option><option value="auto">auto</option></select></label>
     <button id="connect">Connect</button><button id="disconnect" class="secondary">Disconnect</button><button id="clear" class="secondary">Clear</button>
     <span id="status" class="status">Disconnected</span>
@@ -35,6 +36,7 @@
   <section class="card">
     <h2>Teaching controls</h2>
     <p>With <code>ack: auto</code> messages need no acknowledgement. With <code>client-individual</code> each row below gets its own ACK/NACK. With <code>client</code>, ACKing or NACKing a row resolves every earlier unresolved row on the subscription too (cumulative, per STOMP 1.2). A NACK triggers one redelivery with a fresh ack id; NACKing that redelivery drops the message for good.</p>
+    <p>Against the message-queue app, Destination must be <code>&lt;Subscription ID&gt;/&lt;event source name&gt;</code> — it keys your persistent queue by the Subscription ID, and delivers only to that exact destination. Reconnecting with the same Subscription ID resumes your queue instead of starting a new one.</p>
     <div class="toolbar" style="padding:0;border:0;margin-top:0">
       <button id="client-crash" class="secondary">Simulate client crash</button>
       <button id="pause-events" class="secondary">Stop events</button>
@@ -48,7 +50,7 @@
   </div>
 </main>
 <script>
-const $ = id => document.getElementById(id); let socket, subscription = 'browser-subscription'; let reconnectTimer; let manualDisconnect = false;
+const $ = id => document.getElementById(id); let socket; let reconnectTimer; let manualDisconnect = false;
 let pending = new Map(); // ack-id -> row element, insertion order = delivery order
 function esc(value) { return String(value).replaceAll('\\','\\\\').replaceAll('\n','\\n').replaceAll(':','\\c').replaceAll('\r','\\r'); }
 function frame(command, headers={}, body='') { return command+'\n'+Object.entries(headers).map(([k,v])=>k+':'+esc(v)).join('\n')+'\n\n'+body+'\0'; }
@@ -59,7 +61,7 @@ function log(text) { $('log').textContent += new Date().toLocaleTimeString()+' '
 function status(text, cls='') { $('status').textContent=text; $('status').className='status '+cls; }
 function displayFrame(direction, raw) { const text=typeof raw==='string'?raw:new TextDecoder().decode(raw); $('raw-frame').textContent=direction+'\n\n'+text.replace(/\0/g,'<NUL>'); }
 function send(command, headers={}, body='') { const raw=frame(command,headers,body); socket.send(raw); displayFrame('CLIENT → SERVER',raw); log('CLIENT -> SERVER  '+command+'\n'+raw.replace(/\0/g,'<NUL>')); }
-function connect() { manualDisconnect=false; clearTimeout(reconnectTimer); if(socket && socket.readyState<2) socket.close(); pending.clear(); log('connection requested'); status('Connecting…'); socket=new WebSocket($('url').value); socket.binaryType='arraybuffer'; socket.onopen=()=>{ log('connection established'); send('CONNECT',{'accept-version':'1.2',host:'playground','heart-beat':'10000,10000'}); }; socket.onmessage=e=>{ if(e.data==='\n') return; displayFrame('SERVER → CLIENT',e.data); const f=parse(e.data); log('SERVER -> CLIENT  '+f.command+'\n'+(typeof e.data==='string'?e.data:new TextDecoder().decode(e.data)).replace(/\0/g,'<NUL>')); if(f.command==='CONNECTED'){ status('Connected','connected'); send('SUBSCRIBE',{id:subscription,destination:$('destination').value,ack:$('ackmode').value}); } else if(f.command==='MESSAGE') receive(f); else if(f.command==='ERROR'){ status('Server error','error'); log('ERROR: '+f.body); } }; socket.onclose=()=>{ status('Disconnected'); log('connection closed'); pending.clear(); if(!manualDisconnect && $('auto-reconnect').checked){ log('client recovery: reconnecting (delivery is live-only, unresolved messages from the old connection are gone)'); reconnectTimer=setTimeout(connect,1000); } }; socket.onerror=()=>{ status('Connection error','error'); log('connection error'); }; }
+function connect() { manualDisconnect=false; clearTimeout(reconnectTimer); if(socket && socket.readyState<2) socket.close(); pending.clear(); log('connection requested'); status('Connecting…'); socket=new WebSocket($('url').value); socket.binaryType='arraybuffer'; socket.onopen=()=>{ log('connection established'); send('CONNECT',{'accept-version':'1.2',host:'playground','heart-beat':'10000,10000'}); }; socket.onmessage=e=>{ if(e.data==='\n') return; displayFrame('SERVER → CLIENT',e.data); const f=parse(e.data); log('SERVER -> CLIENT  '+f.command+'\n'+(typeof e.data==='string'?e.data:new TextDecoder().decode(e.data)).replace(/\0/g,'<NUL>')); if(f.command==='CONNECTED'){ status('Connected','connected'); send('SUBSCRIBE',{id:$('subscription').value,subscription:$('subscription').value,destination:$('destination').value,ack:$('ackmode').value}); } else if(f.command==='MESSAGE') receive(f); else if(f.command==='ERROR'){ status('Server error','error'); log('ERROR: '+f.body); } }; socket.onclose=()=>{ status('Disconnected'); log('connection closed'); pending.clear(); if(!manualDisconnect && $('auto-reconnect').checked){ log('client recovery: reconnecting (delivery is live-only, unresolved messages from the old connection are gone)'); reconnectTimer=setTimeout(connect,1000); } }; socket.onerror=()=>{ status('Connection error','error'); log('connection error'); }; }
 function disconnect() { manualDisconnect=true; clearTimeout(reconnectTimer); if (socket && socket.readyState === 1) { send('DISCONNECT'); setTimeout(() => socket.close(1000, 'user disconnected'), 100); } else { status('Disconnected'); } }
 function resolveThrough(ackId) { // cumulative for ack:client, single row for client-individual
   const cumulative = $('ackmode').value === 'client';
