@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -152,12 +153,23 @@ func (a *messageQueueApp) onEvent(event string) {
 
 	for _, d := range toDisconnect {
 		a.log.Warn("queue exceeded cap while connected; disconnecting", "destination", d)
-		if err := a.srv.Disconnect(d); err != nil {
-			a.log.Error("disconnect failed", "destination", d, "error", err)
-		}
+		a.disconnectWithReason(d, fmt.Sprintf("event queue exceeded %d messages while connected", a.cfg.maxQueueLen))
 	}
 	for _, clientID := range toDeliver {
 		a.tryDeliver(clientID)
+	}
+}
+
+// disconnectWithReason sends the client at destination an ERROR frame
+// explaining why it's being dropped, then disconnects it. Errors from either
+// step are logged, not returned, since callers always disconnect regardless
+// of whether the ERROR frame made it out.
+func (a *messageQueueApp) disconnectWithReason(destination, reason string) {
+	if err := a.srv.SendError(destination, reason); err != nil {
+		a.log.Error("send error frame failed", "destination", destination, "error", err)
+	}
+	if err := a.srv.Disconnect(destination); err != nil {
+		a.log.Error("disconnect failed", "destination", destination, "error", err)
 	}
 }
 
@@ -288,9 +300,7 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 		destination := a.destinations[clientID]
 		a.mu.Unlock()
 		a.log.Warn("retry budget exhausted; disconnecting client", "subscription", clientID, "destination", destination)
-		if err := a.srv.Disconnect(destination); err != nil {
-			a.log.Error("disconnect failed", "destination", destination, "error", err)
-		}
+		a.disconnectWithReason(destination, fmt.Sprintf("no ACK received after %d retries", a.cfg.maxRetries))
 		return
 	}
 	inFlight.attempt++

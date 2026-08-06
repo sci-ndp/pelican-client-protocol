@@ -293,6 +293,49 @@ func TestIntegration_OnAckFiresOncePerMessageOnCumulativeAck(t *testing.T) {
 	}
 }
 
+func TestIntegration_SendErrorDeliversErrorFrameToSubscribedConnection(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	// SUBSCRIBE is processed asynchronously on the server's connection
+	// goroutine, so Connected may not reflect it the instant Subscribe returns.
+	deadline := time.Now().Add(2 * time.Second)
+	for !srv.Connected("/topic/test") {
+		if time.Now().After(deadline) {
+			t.Fatal("Connected(\"/topic/test\") stayed false after subscribing")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := srv.SendError("/topic/test", "misbehaving client"); err != nil {
+		t.Fatalf("SendError: %v", err)
+	}
+
+	select {
+	case msg := <-sub.C:
+		if msg.Err == nil {
+			t.Fatal("expected an ERROR message, got a normal MESSAGE")
+		}
+		if msg.Err.Error() != "misbehaving client" {
+			t.Errorf("error = %q, want %q", msg.Err.Error(), "misbehaving client")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the ERROR frame")
+	}
+}
+
+func TestIntegration_SendErrorNoOpWhenNobodySubscribed(t *testing.T) {
+	_, srv := startTestServer(t, NoAuth{})
+	if err := srv.SendError("/topic/nobody-here", "reason"); err != nil {
+		t.Errorf("SendError on an unsubscribed destination: %v, want nil", err)
+	}
+}
+
 func TestIntegration_DisconnectClosesSubscribedConnection(t *testing.T) {
 	wsURL, srv := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)

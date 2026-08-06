@@ -21,16 +21,24 @@ type publishCall struct {
 	body        string
 }
 
-// fakeStompServer is a stomp.StompServer test double: it records Publish and
-// Disconnect calls, lets a test drive the app's OnSubscribe/OnAck callbacks
-// directly, and lets a test control what Connected reports, all without any
-// real network I/O.
+// sentError records one SendError invocation the app made against the fake
+// server.
+type sentError struct {
+	destination string
+	message     string
+}
+
+// fakeStompServer is a stomp.StompServer test double: it records Publish,
+// SendError, and Disconnect calls, lets a test drive the app's
+// OnSubscribe/OnAck callbacks directly, and lets a test control what
+// Connected reports, all without any real network I/O.
 type fakeStompServer struct {
 	mu             sync.Mutex
 	onSubscribeFns []func(map[string]string)
 	onAckFns       []func(map[string]string)
 	connected      map[string]bool
 	publishes      []publishCall
+	sentErrors     []sentError
 	disconnects    []string
 }
 
@@ -55,6 +63,13 @@ func (f *fakeStompServer) OnAck(fn func(headers map[string]string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onAckFns = append(f.onAckFns, fn)
+}
+
+func (f *fakeStompServer) SendError(destination string, message string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sentErrors = append(f.sentErrors, sentError{destination: destination, message: message})
+	return nil
 }
 
 func (f *fakeStompServer) Disconnect(destination string) error {
@@ -87,6 +102,12 @@ func (f *fakeStompServer) snapshotDisconnects() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string{}, f.disconnects...)
+}
+
+func (f *fakeStompServer) snapshotSentErrors() []sentError {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentError{}, f.sentErrors...)
 }
 
 // fakeEventSource is an EventSource test double whose channel a test can
@@ -370,6 +391,9 @@ func TestOnEvent_DisconnectsConnectedClientOnOverflow(t *testing.T) {
 	if got := srv.snapshotDisconnects(); len(got) != 1 || got[0] != "alice/testsource" {
 		t.Fatalf("disconnects = %v, want exactly one disconnect of alice/testsource", got)
 	}
+	if got := srv.snapshotSentErrors(); len(got) != 1 || got[0].destination != "alice/testsource" || got[0].message == "" {
+		t.Fatalf("sent errors = %+v, want exactly one non-empty ERROR to alice/testsource before disconnecting", got)
+	}
 
 	app.mu.Lock()
 	q := app.queues["alice"]
@@ -413,6 +437,9 @@ func TestOnEvent_TrimsWithoutDisconnectingWhenOffline(t *testing.T) {
 	if got := srv.snapshotPublishes(); len(got) != 0 {
 		t.Fatalf("publishes = %v, want none while offline", got)
 	}
+	if got := srv.snapshotSentErrors(); len(got) != 0 {
+		t.Fatalf("sent errors = %v, want none while offline", got)
+	}
 
 	app.mu.Lock()
 	q := app.queues["alice"]
@@ -455,6 +482,9 @@ func TestOnRetryTimeout_BacksOffThenGivesUpAndDisconnects(t *testing.T) {
 	disconnects := srv.snapshotDisconnects()
 	if len(disconnects) != 1 || disconnects[0] != "alice/testsource" {
 		t.Fatalf("disconnects = %v, want exactly one disconnect of alice/testsource", disconnects)
+	}
+	if got := srv.snapshotSentErrors(); len(got) != 1 || got[0].destination != "alice/testsource" || got[0].message == "" {
+		t.Fatalf("sent errors = %+v, want exactly one non-empty ERROR to alice/testsource before disconnecting", got)
 	}
 
 	publishes := srv.snapshotPublishes()

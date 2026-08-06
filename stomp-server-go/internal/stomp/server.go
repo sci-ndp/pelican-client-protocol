@@ -118,6 +118,12 @@ type StompServer interface {
 	// while holding a lock.
 	OnAck(fn func(headers map[string]string))
 
+	// SendError sends an ERROR frame carrying message to every session
+	// currently subscribed to destination, without closing the connection.
+	// It is a no-op if none is. Typically paired with a following Disconnect
+	// call, so a client being dropped for misbehaving gets a reason first.
+	SendError(destination string, message string) error
+
 	// Disconnect closes every session currently subscribed to destination.
 	// It is a no-op if none is.
 	Disconnect(destination string) error
@@ -141,6 +147,26 @@ func (s *Server) OnAck(fn func(headers map[string]string)) {
 	s.mu.Lock()
 	s.onAck = append(s.onAck, fn)
 	s.mu.Unlock()
+}
+
+// SendError implements StompServer.
+func (s *Server) SendError(destination string, message string) error {
+	s.mu.Lock()
+	var sessions []*session
+	for conn := range s.subscriptions[destination] {
+		if sess, ok := s.sessions[conn]; ok {
+			sessions = append(sessions, sess)
+		}
+	}
+	s.mu.Unlock()
+
+	var errs []error
+	for _, sess := range sessions {
+		if err := s.send(sess, NewFrame("ERROR", map[string]string{"message": message}, message)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Disconnect implements StompServer. Closing conn unblocks that
@@ -247,6 +273,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			if errors.As(err, &protoErr) {
 				s.send(sess, NewFrame("ERROR", map[string]string{"message": protoErr.Error()}, protoErr.Error()))
 			}
+			s.log.Debug("CLIENT disconnected", "error", err, "subscriptions", len(sess.subscriptions))
 			// otherwise: connection closed, or some other I/O error; clean up via defer
 			return
 
