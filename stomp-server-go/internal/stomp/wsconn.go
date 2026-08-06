@@ -47,7 +47,24 @@ func (c *wsConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *wsConn) Close() error { return c.ws.Close() }
+// closeGracePeriod bounds how long Close waits to hand off the WebSocket
+// close control frame before giving up and closing the underlying connection
+// regardless.
+const closeGracePeriod = 1 * time.Second
+
+// Close performs the WebSocket-level closing handshake -- sending a close
+// control frame -- before closing the underlying connection. gorilla/
+// websocket's own Close only tears down the TCP connection, with no close
+// frame; a peer that already sent (or is about to send) its own close frame
+// as part of a graceful shutdown, like stomp-client's graceful disconnect,
+// then sees an abrupt/abnormal closure instead of a clean one. WriteControl
+// is documented safe to call concurrently with other writes, so this needs
+// no coordination with sendBytes's writeMu.
+func (c *wsConn) Close() error {
+	deadline := time.Now().Add(closeGracePeriod)
+	_ = c.ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+	return c.ws.Close()
+}
 
 func (c *wsConn) LocalAddr() net.Addr  { return c.ws.LocalAddr() }
 func (c *wsConn) RemoteAddr() net.Addr { return c.ws.RemoteAddr() }
