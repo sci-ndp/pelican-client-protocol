@@ -41,15 +41,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", stomp.RequireAuth(authenticator, listener))
 
-	httpServer := &http.Server{Addr: addr, Handler: mux}
-	go func() {
-		logger.Info("STOMP 1.2 WebSocket server listening", "addr", "ws://0.0.0.0"+addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("http server failed", "error", err)
-			os.Exit(1)
-		}
-	}()
-
 	newQueue := queueFactory(newMemoryClientQueue)
 	if *queueDB != "" {
 		db, err := openQueueDB(*queueDB)
@@ -80,7 +71,18 @@ func main() {
 	}
 
 	srv := stomp.NewServer(logger)
-	newMessageQueueApp(srv, logger, source, newQueue)
+	app := newMessageQueueApp(srv, logger, source, newQueue)
+	mux.Handle("/metrics", app.MetricsHandler())
+
+	httpServer := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		logger.Info("STOMP 1.2 WebSocket server listening", "addr", "ws://0.0.0.0"+addr)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("http server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
 	if err := srv.Serve(listener); err != nil {
 		logger.Error("stomp server failed", "error", err)
 		os.Exit(1)

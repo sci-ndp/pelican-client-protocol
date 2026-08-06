@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -45,10 +46,11 @@ var defaultMessageQueueConfig = messageQueueConfig{
 // *time.Timer can't survive a restart, so this stays in-memory regardless of
 // which clientQueue implementation is in use.
 type inFlightDelivery struct {
-	messageID string // stable across retries; only the ack id changes
-	attempt   int    // retries already attempted; 0 before the first retry
-	delay     time.Duration
-	timer     *time.Timer
+	messageID   string // stable across retries; only the ack id changes
+	attempt     int    // retries already attempted; 0 before the first retry
+	delay       time.Duration
+	timer       *time.Timer
+	firstSentAt time.Time // set once, at the original send; used for ack-latency
 }
 
 // messageQueueApp is a small application layer built entirely on the
@@ -65,6 +67,7 @@ type messageQueueApp struct {
 	source   EventSource
 	cfg      messageQueueConfig
 	newQueue queueFactory
+	metrics  *appMetrics
 
 	mu           sync.Mutex
 	queues       map[string]clientQueue       // client's `subscription` header value -> queue
@@ -87,6 +90,7 @@ func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, sourc
 		source:       source,
 		cfg:          cfg,
 		newQueue:     newQueue,
+		metrics:      newAppMetrics(),
 		queues:       map[string]clientQueue{},
 		inFlights:    map[string]*inFlightDelivery{},
 		destinations: map[string]string{},
@@ -96,6 +100,12 @@ func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, sourc
 	srv.OnAck(a.onAck)
 	go a.run()
 	return a
+}
+
+// MetricsHandler serves this app's Prometheus metrics in the text exposition
+// format, suitable for mounting at e.g. "/metrics".
+func (a *messageQueueApp) MetricsHandler() http.Handler {
+	return a.metrics.Handler()
 }
 
 // run is the single goroutine that ever reads from source.Events(); all
@@ -129,6 +139,7 @@ func (a *messageQueueApp) onEvent(event string) {
 	a.mu.Lock()
 	if len(a.queues) == 0 {
 		a.mu.Unlock()
+		a.metrics.eventDropped()
 		return
 	}
 
@@ -138,10 +149,16 @@ func (a *messageQueueApp) onEvent(event string) {
 		overflowed, err := q.Enqueue(event, a.cfg.maxQueueLen)
 		if err != nil {
 			a.log.Error("queue enqueue failed", "subscription", clientID, "error", err)
+			a.metrics.queueErrorOccurred("enqueue")
 			continue
 		}
+		a.metrics.eventEnqueued()
 		destination := a.destinations[clientID]
 		connected := a.srv.Connected(destination)
+		if overflowed {
+			a.metrics.eventTrimmed()
+			a.metrics.queueOverflowed(connected)
+		}
 		if overflowed && connected {
 			a.clearInFlight(clientID)
 			toDisconnect = append(toDisconnect, destination)
@@ -153,6 +170,7 @@ func (a *messageQueueApp) onEvent(event string) {
 
 	for _, d := range toDisconnect {
 		a.log.Warn("queue exceeded cap while connected; disconnecting", "destination", d)
+		a.metrics.clientDisconnected("queue_overflow")
 		a.disconnectWithReason(d, fmt.Sprintf("event queue exceeded %d messages while connected", a.cfg.maxQueueLen))
 	}
 	for _, clientID := range toDeliver {
@@ -200,17 +218,20 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	destination := headers["destination"]
 	if clientID == "" || destination == "" {
 		a.log.Warn("SUBSCRIBE missing subscription/destination header; ignoring", "headers", headers)
+		a.metrics.subscribeRejected("missing_headers")
 		return
 	}
 	if !hasOwningSegment(destination, clientID) {
 		a.log.Warn("SUBSCRIBE destination does not start with the client's own subscription id; ignoring",
 			"subscription", clientID, "destination", destination)
+		a.metrics.subscribeRejected("wrong_owner")
 		return
 	}
 	if ack := headers["ack"]; ack != "client-individual" {
 		a.log.Warn("client subscribed without ack:client-individual; retries won't work correctly",
 			"subscription", clientID, "ack", ack)
 	}
+	a.metrics.subscribeAccepted()
 
 	a.mu.Lock()
 	if old, ok := a.destinations[clientID]; ok && old != destination {
@@ -223,6 +244,7 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	if !existed {
 		q = a.newQueue(clientID)
 		a.queues[clientID] = q
+		a.metrics.queueCreated()
 	}
 	a.clearInFlight(clientID)
 	a.mu.Unlock()
@@ -233,6 +255,7 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	// clientID, so ask the queue itself whether there's anything to resume.
 	if n, err := q.Len(); err != nil {
 		a.log.Warn("queue length check failed", "subscription", clientID, "error", err)
+		a.metrics.queueErrorOccurred("len")
 	} else if existed || n > 0 {
 		a.log.Info("resumed existing event queue", "subscription", clientID, "queued", n)
 	} else {
@@ -254,13 +277,14 @@ func (a *messageQueueApp) tryDeliver(clientID string) {
 	if err != nil {
 		a.mu.Unlock()
 		a.log.Error("queue peek failed", "subscription", clientID, "error", err)
+		a.metrics.queueErrorOccurred("peek")
 		return
 	}
 	if !hasEvent {
 		a.mu.Unlock()
 		return
 	}
-	inFlight := &inFlightDelivery{messageID: uuid.NewString(), delay: a.cfg.initialRetryDelay}
+	inFlight := &inFlightDelivery{messageID: uuid.NewString(), delay: a.cfg.initialRetryDelay, firstSentAt: time.Now()}
 	a.inFlights[clientID] = inFlight
 	destination := a.destinations[clientID]
 	a.mu.Unlock()
@@ -277,6 +301,7 @@ func (a *messageQueueApp) sendAndArm(clientID, destination, body string, inFligh
 	if err := a.srv.Publish(destination, inFlight.messageID, body); err != nil {
 		a.log.Error("publish failed", "destination", destination, "error", err)
 	}
+	a.metrics.messagePublished()
 
 	a.mu.Lock()
 	inFlight.timer = time.AfterFunc(inFlight.delay, func() {
@@ -300,6 +325,7 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 		destination := a.destinations[clientID]
 		a.mu.Unlock()
 		a.log.Warn("retry budget exhausted; disconnecting client", "subscription", clientID, "destination", destination)
+		a.metrics.clientDisconnected("retry_exhausted")
 		a.disconnectWithReason(destination, fmt.Sprintf("no ACK received after %d retries", a.cfg.maxRetries))
 		return
 	}
@@ -310,11 +336,13 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 	a.mu.Unlock()
 	if err != nil {
 		a.log.Error("queue peek failed", "subscription", clientID, "error", err)
+		a.metrics.queueErrorOccurred("peek")
 		return
 	}
 	if !hasEvent {
 		return
 	}
+	a.metrics.retryAttempted()
 
 	a.sendAndArm(clientID, destination, body, inFlight)
 }
@@ -338,16 +366,21 @@ func (a *messageQueueApp) onAck(headers map[string]string) {
 		a.mu.Unlock()
 		return
 	}
+	ackLatency := time.Since(inFlight.firstSentAt)
 	a.clearInFlight(clientID)
 	if err := q.PopFront(); err != nil {
 		a.mu.Unlock()
 		a.log.Error("queue pop failed", "subscription", clientID, "error", err)
+		a.metrics.queueErrorOccurred("pop")
 		return
 	}
 	remaining, err := q.Len()
 	a.mu.Unlock()
+	a.metrics.acked(ackLatency)
+	a.metrics.eventDelivered()
 	if err != nil {
 		a.log.Error("queue length check failed", "subscription", clientID, "error", err)
+		a.metrics.queueErrorOccurred("len")
 		return
 	}
 
