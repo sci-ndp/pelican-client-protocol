@@ -29,5 +29,12 @@ services:
     ports:
       - "${UI_PORT:-8000}:8000"
 
+  client-ui2:
+    build:
+      context: ../../UI2
+    restart: unless-stopped
+    ports:
+      - "${UI2_PORT:-8002}:8000"
+
 volumes:
   client-data:

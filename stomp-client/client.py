@@ -55,6 +55,7 @@ class StompClient:
         self.state = ClientPersistence(os.getenv("CLIENT_DB", "client.sqlite3"), args.client_id)
         self.log = logging.getLogger("stomp-client")
         self.log_buffer = next((handler for handler in self.log.handlers if isinstance(handler, ClientLogBuffer)), None)
+        self.message_bodies = deque(maxlen=200)
         self.events_seen = 0
         self.drop_ack_percent = float(os.getenv("DROP_ACK_PERCENT", "0"))
         self.disconnect_after = int(os.getenv("DISCONNECT_AFTER", "0"))
@@ -93,7 +94,7 @@ class StompClient:
 
     async def run(self) -> None:
         await asyncio.start_server(self.handle_http_request, "0.0.0.0", self.args.log_port)
-        self.log.info("application API listening address=0.0.0.0 port=%s paths=/logs,/status,/config,/connect,/disconnect,/simulation/*", self.args.log_port)
+        self.log.info("application API listening address=0.0.0.0 port=%s paths=/logs,/messages,/status,/config,/connect,/disconnect,/disconnect/graceful,/simulation/*", self.args.log_port)
         delay = 1
         while True:
             if not self.enabled:
@@ -116,6 +117,10 @@ class StompClient:
                 else:
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 30)
+
+    def received_messages(self) -> list[str]:
+        """Return recent MESSAGE bodies received by this client, oldest first."""
+        return list(self.message_bodies)
 
     def status_payload(self) -> dict:
         return {
@@ -177,6 +182,22 @@ class StompClient:
         if self.active_ws is not None:
             await self.active_ws.close(code=4000, reason="configuration updated")
 
+    async def graceful_disconnect(self) -> None:
+        """End the active STOMP session by sending DISCONNECT before closing WebSocket."""
+        self.enabled = False
+        self.connection_state = "disconnecting"
+        self.last_error = ""
+        if self.active_ws is None:
+            self.connection_state = "disconnected"
+            self.log.info("graceful disconnect requested with no active STOMP session")
+            return
+        try:
+            await self.send(self.active_ws, Frame("DISCONNECT", {}))
+            self.log.info("graceful STOMP DISCONNECT sent; closing WebSocket")
+            await self.active_ws.close(code=1000, reason="graceful client disconnect")
+        finally:
+            self.session_headers = {}
+
     def configure_simulation(self, payload: dict) -> None:
         path = payload.get("path")
         if path == "drop-acks":
@@ -223,6 +244,8 @@ class StompClient:
                 response, status = {}, "200 OK"
             elif method == "GET" and path == "/logs":
                 response, status = {"logs": self.log_buffer.snapshot() if self.log_buffer else []}, "200 OK"
+            elif method == "GET" and path == "/messages":
+                response, status = {"messages": self.received_messages()}, "200 OK"
             elif method == "GET" and path == "/status":
                 response, status = self.status_payload(), "200 OK"
             elif method == "POST" and path == "/config":
@@ -236,6 +259,9 @@ class StompClient:
                 self.enabled = False
                 if self.active_ws is not None:
                     await self.active_ws.close(code=1000, reason="client disabled by application API")
+                response, status = self.status_payload(), "200 OK"
+            elif method == "POST" and path == "/disconnect/graceful":
+                await self.graceful_disconnect()
                 response, status = self.status_payload(), "200 OK"
             elif method == "POST" and path.startswith("/simulation/"):
                 action = path.removeprefix("/simulation/")
@@ -319,6 +345,7 @@ class StompClient:
 
     async def on_message(self, ws, frame: Frame) -> None:
         self.events_seen += 1
+        self.message_bodies.append(frame.body)
         destination = frame.headers.get("destination", "")
         event_id = self.application_event_id(frame)
         if self.state.record_event(event_id, destination, frame.body):

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STOMP Client · NDP</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@500;600&family=Roboto:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root{--ndp-bg:#f4f8fc;--ndp-surface:#fff;--ndp-surface-alt:#f7fbff;--ndp-surface-soft:#eef5fb;--ndp-line:#d7e3ef;--ndp-line-strong:#bdd0e4;--ndp-text:#14263a;--ndp-text-muted:#63788f;--ndp-primary:#0071ff;--ndp-primary-hover:#0885ff;--ndp-primary-soft:#edf5ff;--ndp-danger:#c2574c;--ndp-danger-soft:#fff1ef;--ndp-warn:#a86d00;--ndp-warn-soft:#fff8e8}
+    *{box-sizing:border-box}body{margin:0;background:var(--ndp-bg);color:var(--ndp-text);font:14px Roboto,sans-serif}.app{min-height:100vh;display:grid;grid-template-columns:248px minmax(0,1fr)}aside{background:var(--ndp-surface);border-right:1px solid var(--ndp-line);padding:24px 16px}.brand{font:600 18px Lexend,sans-serif;margin:0 8px 28px}nav{display:grid;gap:4px}nav a{color:var(--ndp-text-muted);padding:10px 12px;border-radius:8px;text-decoration:none;font-weight:500}nav a:hover,nav a.active{color:var(--ndp-primary);background:var(--ndp-primary-soft)}.sidebar-note{position:fixed;bottom:24px;width:212px;border-top:1px solid var(--ndp-line);padding:16px 8px 0;color:var(--ndp-text-muted);line-height:1.5}.content{max-width:1320px;width:100%;padding:0 28px 32px;margin:0 auto}.toolbar{min-height:88px;border-bottom:1px solid var(--ndp-line);display:flex;align-items:center;justify-content:space-between;gap:24px}.toolbar h1{font:600 28px Lexend,sans-serif;margin:0}.toolbar p{margin:6px 0 0;color:var(--ndp-text-muted)}.connection-state{border:1px solid var(--ndp-line-strong);border-radius:8px;background:var(--ndp-surface);padding:9px 12px;color:var(--ndp-text-muted);font-weight:500}.connection-state.connected{color:#166b3b;background:#f0fbf4;border-color:#b8e2c7}.connection-state.error{color:var(--ndp-danger);background:var(--ndp-danger-soft);border-color:#efc5c0}section{margin-top:20px}.section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:10px}.section-heading h2{font:600 18px Lexend,sans-serif;margin:0}.section-heading p{margin:0;color:var(--ndp-text-muted)}.card{background:var(--ndp-surface);border:1px solid var(--ndp-line);border-radius:10px;padding:20px}.config-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.field{display:grid;gap:6px;color:var(--ndp-text-muted);font-size:13px;font-weight:500}.field.wide{grid-column:span 2}input,select{min-width:0;border:1px solid var(--ndp-line-strong);border-radius:8px;background:#fff;color:var(--ndp-text);font:14px Roboto,sans-serif;padding:9px 10px}input:focus,select:focus{outline:2px solid #b9dcff;border-color:var(--ndp-primary)}input[readonly]{background:var(--ndp-surface-soft);color:var(--ndp-text-muted)}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}.actions.split{justify-content:space-between;align-items:center}.button{appearance:none;border:1px solid var(--ndp-primary);border-radius:8px;background:var(--ndp-primary);color:#fff;padding:9px 12px;font:500 14px Roboto,sans-serif;cursor:pointer;transition:background 160ms ease,border-color 160ms ease}.button:hover{background:var(--ndp-primary-hover);border-color:var(--ndp-primary-hover)}.button.secondary{background:#fff;border-color:var(--ndp-line-strong);color:var(--ndp-text)}.button.secondary:hover{background:var(--ndp-surface-soft)}.button.warning{background:var(--ndp-warn-soft);border-color:#e7c876;color:#735000}.button.warning:hover{background:#ffefc4}.button.danger{background:var(--ndp-danger-soft);border-color:#efc5c0;color:#984139}.status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--ndp-line);border-radius:8px;overflow:hidden}.status-grid div{padding:13px;border-right:1px solid var(--ndp-line);min-width:0}.status-grid div:last-child{border-right:0}.status-grid dt{font-size:12px;color:var(--ndp-text-muted);margin-bottom:5px}.status-grid dd{font:500 14px Roboto,sans-serif;margin:0;overflow-wrap:anywhere}.console{margin:0;border:1px solid var(--ndp-line);border-radius:8px;background:#f9fcff;color:#243b53;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word;min-height:180px;max-height:360px;overflow:auto;padding:14px}.message-console{min-height:160px;background:var(--ndp-surface-alt)}.message-list{margin:0;height:401px;border:1px solid var(--ndp-line);border-radius:8px;background:var(--ndp-surface-alt);overflow-y:scroll;overflow-x:hidden}.message-row{display:grid;grid-template-columns:44px minmax(0,1fr);gap:12px;align-items:baseline;height:40px;padding:10px 14px;border-bottom:1px solid var(--ndp-line);font:14px/1.45 Roboto,sans-serif}.message-row:last-child{border-bottom:0}.message-number{color:var(--ndp-text-muted);font:500 12px ui-monospace,SFMono-Regular,Consolas,monospace;text-align:right}.message-body{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.message-empty{margin:0;padding:14px;color:var(--ndp-text-muted)}.simulation-line{display:flex;align-items:end;gap:8px;flex-wrap:wrap}.simulation-line .field{width:150px}.api-note{color:var(--ndp-text-muted);font-size:13px}@media(max-width:900px){.app{grid-template-columns:1fr}aside{display:none}.content{padding:0 18px 24px}.config-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.status-grid div:nth-child(2){border-right:0}.status-grid div:nth-child(-n+2){border-bottom:1px solid var(--ndp-line)}}@media(max-width:600px){.toolbar{align-items:flex-start;padding:20px 0;min-height:auto}.toolbar h1{font-size:24px}.toolbar p{display:none}.config-grid{grid-template-columns:1fr}.field.wide{grid-column:auto}.status-grid{grid-template-columns:1fr}.status-grid div{border-right:0;border-bottom:1px solid var(--ndp-line)}.status-grid div:last-child{border-bottom:0}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand">National Data Platform</div>
+      <nav>
+        <a class="active" href="#overview">Overview</a>
+        <a href="#configuration">Configuration</a>
+        <a href="#simulation">Fault simulation</a>
+        <a href="#messages">Messages</a>
+        <a href="#logs">Client logs</a>
+      </nav>
+      <div class="sidebar-note">UI2 observes and controls the existing Python client through its HTTP application API. It does not open a STOMP connection.</div>
+    </aside>
+    <main class="content">
+      <header class="toolbar">
+        <div><h1>STOMP client</h1><p>Message queue connection, delivery policy testing, and received message bodies.</p></div>
+        <div id="connection-state" class="connection-state">Loading client status</div>
+      </header>
+
+      <section id="overview">
+        <div class="section-heading"><h2>Connection</h2><p id="connection-detail">Waiting for the client API.</p></div>
+        <div class="card"><dl class="status-grid"><div><dt>State</dt><dd id="state-value">—</dd></div><div><dt>Channel</dt><dd id="channel-value">—</dd></div><div><dt>Session</dt><dd id="session-value">—</dd></div><div><dt>Pending ACK drops</dt><dd id="drop-value">—</dd></div></dl></div>
+      </section>
+
+      <section id="configuration">
+        <div class="section-heading"><h2>Client configuration</h2><p>Changes are applied to the Python client, which then reconnects.</p></div>
+        <div class="card">
+          <div class="config-grid">
+            <label class="field wide">Upstream WebSocket URL<input id="url"></label>
+            <label class="field">Heartbeat (ms)<input id="heartbeat" type="number" min="1000"></label>
+            <label class="field">Log detail<select id="log-level"><option value="INFO">INFO summaries</option><option value="DEBUG">DEBUG frames</option></select></label>
+            <label class="field">STOMP client ID<input id="client-id"></label>
+            <label class="field">Queue subscription key<input id="subscription"></label>
+            <label class="field">Event source<input id="event-source"></label>
+            <label class="field wide">Derived server channel<input id="destination" readonly></label>
+            <label class="field">Username<input id="username" autocomplete="username"></label>
+            <label class="field">Password<input id="password" type="password" autocomplete="current-password" placeholder="Leave unchanged"></label>
+          </div>
+          <div class="actions split"><div class="actions"><button class="button" id="apply">Apply settings and reconnect</button><button class="button secondary" id="graceful-disconnect">Graceful disconnect</button><button class="button secondary" id="disconnect">Disconnect client</button></div><span class="api-note">Password is retained by the client when left blank.</span></div>
+        </div>
+      </section>
+
+      <section id="simulation">
+        <div class="section-heading"><h2>Fault simulation</h2><p>These controls alter the existing client’s ACK and connection behavior.</p></div>
+        <div class="card">
+          <div class="actions"><button class="button warning" id="drop-one">Drop next ACK</button><button class="button warning" id="drop-exhaust">Drop 17 ACKs</button><button class="button warning" id="disconnect-next">Disconnect before next ACK</button><button class="button danger" id="close-now">Close connection now</button><button class="button secondary" id="reset-sim">Reset simulations</button></div>
+          <div class="simulation-line"><label class="field">Random ACK loss (%)<input id="random-loss" type="number" min="0" max="100" value="0"></label><button class="button secondary" id="set-random">Set random loss</button></div>
+        </div>
+      </section>
+
+      <section id="messages">
+        <div class="section-heading"><h2>Received message bodies</h2><p>One delivery per line. Retries appear again to make ACK-loss behavior visible.</p></div>
+        <div id="messages" class="message-list" aria-live="polite"><p class="message-empty">No messages received yet.</p></div>
+      </section>
+
+      <section id="logs">
+        <div class="section-heading"><h2>Client logs</h2><p>Connection state, frames, ACK decisions, retries, and heartbeats.</p></div>
+        <pre id="logs-output" class="console">Waiting for client logs.</pre>
+      </section>
+    </main>
+  </div>
+<script>
+const $=id=>document.getElementById(id),NL=String.fromCharCode(10);
+const apiBase=window.location.protocol+'//'+window.location.hostname+':8081';
+const settingsKey='stomp-ui2-settings';
+const settingIds=['url','heartbeat','log-level','client-id','subscription','event-source','username'];
+let loaded=false;
+function logAction(message){const output=$('logs-output');output.textContent+=NL+new Date().toLocaleTimeString()+' UI2: '+message;output.scrollTop=output.scrollHeight}
+function savedSettings(){try{return JSON.parse(localStorage.getItem(settingsKey)||'{}')}catch(error){return {}}}
+function saveSettings(){const values={};for(const id of settingIds)values[id]=$(id).value;localStorage.setItem(settingsKey,JSON.stringify(values))}
+function updateChannel(){$('destination').value=$('subscription').value.trim()+'/'+$('event-source').value.trim()}
+async function request(path,method='GET',body){const response=await fetch(apiBase+path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined,cache:'no-store'});const data=await response.json();if(!response.ok)throw new Error(data.error||'HTTP '+response.status);return data}
+function fillConfig(config){if(loaded)return;const saved=savedSettings();$('url').value=saved.url||config.url;$('heartbeat').value=saved.heartbeat||config.heartbeat;$('log-level').value=saved['log-level']||config.log_level;$('client-id').value=saved['client-id']||config.client_id;$('subscription').value=saved.subscription||config.subscription;$('event-source').value=saved['event-source']||config.event_source;$('username').value=saved.username||config.username||'';updateChannel();loaded=true}
+function renderStatus(current){const state=current.state;$('connection-state').textContent=state+(current.last_error?' · '+current.last_error:'');$('connection-state').className='connection-state '+(state==='connected'?'connected':state==='error'?'error':'');$('connection-detail').textContent=current.last_error||'The Python client owns the upstream STOMP connection.';$('state-value').textContent=state;$('channel-value').textContent=current.config.destination;$('session-value').textContent=current.session.session||'—';$('drop-value').textContent=current.simulation.drop_next_acks}
+function renderMessages(items){const list=$('messages'),atBottom=list.scrollHeight-list.scrollTop-list.clientHeight<8;list.replaceChildren();if(!items.length){const empty=document.createElement('p');empty.className='message-empty';empty.textContent='No messages received yet.';list.append(empty);return}items.forEach((body,index)=>{const row=document.createElement('div'),number=document.createElement('span'),message=document.createElement('span');row.className='message-row';number.className='message-number';message.className='message-body';number.textContent=String(index+1);message.textContent=body;message.title=body;row.append(number,message);list.append(row)});if(atBottom)list.scrollTop=list.scrollHeight}
+async function refresh(){try{const current=await request('/status');fillConfig(current.config);renderStatus(current);$('random-loss').value=current.simulation.random_ack_loss_percent;const messages=await request('/messages');renderMessages(messages.messages.slice(-10));const logs=await request('/logs');$('logs-output').textContent=logs.logs.join(NL)||'No client logs yet.';$('logs-output').scrollTop=$('logs-output').scrollHeight}catch(error){$('connection-state').textContent='Client API unavailable';$('connection-state').className='connection-state error';$('connection-detail').textContent=error.message}}
+async function apply(){saveSettings();const username=$('username').value,password=$('password').value;if(password&&!username){logAction('Username is required when a password is provided.');return}const payload={url:$('url').value.trim(),heartbeat:Number($('heartbeat').value),log_level:$('log-level').value,client_id:$('client-id').value.trim(),subscription:$('subscription').value.trim(),event_source:$('event-source').value.trim(),username};if(password)payload.password=password;try{await request('/config','POST',payload);$('password').value='';logAction('Applied configuration and requested reconnect for '+$('destination').value);await refresh()}catch(error){logAction('Configuration error: '+error.message)}}
+async function simulate(path,body,label){try{await request('/simulation/'+path,'POST',body);logAction(label);await refresh()}catch(error){logAction('Simulation error: '+error.message)}}
+async function disconnect(){try{await request('/disconnect','POST');logAction('Requested immediate client disconnect');await refresh()}catch(error){logAction('Disconnect error: '+error.message)}}
+async function gracefulDisconnect(){try{await request('/disconnect/graceful','POST');logAction('Sent STOMP DISCONNECT and closed the client session');await refresh()}catch(error){logAction('Graceful disconnect error: '+error.message)}}
+for(const id of settingIds)$(id).addEventListener('change',()=>{saveSettings();updateChannel()});
+$('apply').onclick=apply;$('graceful-disconnect').onclick=gracefulDisconnect;$('disconnect').onclick=disconnect;$('drop-one').onclick=()=>simulate('drop-acks',{count:1},'Dropped next ACK');$('drop-exhaust').onclick=()=>simulate('drop-acks',{count:17},'Dropped 17 ACKs');$('disconnect-next').onclick=()=>simulate('disconnect-next-message',{count:1},'Will disconnect before next ACK');$('close-now').onclick=()=>simulate('close-connection',{},'Closed connection');$('reset-sim').onclick=()=>simulate('reset',{},'Reset simulation controls');$('set-random').onclick=()=>simulate('random-ack-loss',{percent:Number($('random-loss').value)},'Set random ACK loss');
+setInterval(refresh,1000);refresh();
+</script>
+</body>
+</html>
