@@ -1,18 +1,29 @@
 services:
   server:
     build: ./stomp-server-go
-    # QUEUE_DB and TEST_EVENT_SEQ_FILE are opt-in: leave them unset for the
-    # default in-memory queue and non-persistent demo ticker, or set them
-    # (e.g. QUEUE_DB=/data/queue.sqlite3, TEST_EVENT_SEQ_FILE=/data/event-seq.txt)
-    # to persist the client queues and event sequence number in /data across
-    # container restarts. --queue-db is a CLI flag rather than an env var on
-    # the server binary, so this wraps the command in a shell to only pass it
-    # when QUEUE_DB is set.
+    # QUEUE_DB, TEST_EVENT_SEQ_FILE, and WATCH_PELICAN_URL are opt-in: leave
+    # them unset for the default in-memory queue and non-persistent demo
+    # ticker. --queue-db/--pelican-url/--pelican-state-file are CLI flags
+    # rather than env vars on the server binary, so this wraps the command
+    # in a shell to only pass them when the corresponding env var is set.
+    # main.go picks at most one event source, in priority order: the Pelican
+    # directory watcher (which shells out to the pelican CLI baked into this
+    # image) if WATCH_PELICAN_URL is set, else the persistent seq-file demo
+    # source if TEST_EVENT_SEQ_FILE is set, else the plain ticker -- so with
+    # WATCH_PELICAN_URL set below, TEST_EVENT_SEQ_FILE is present but
+    # currently inert. Deliberately NOT prefixed with PELICAN_ (e.g.
+    # PELICAN_URL, or even PELICAN_WATCH_URL): the pelican CLI itself grabs
+    # every env var starting with "PELICAN_", strips that prefix, and maps
+    # whatever's left to one of its own config keys, so any PELICAN_-prefixed
+    # name here causes it to print spurious "Unknown configuration keys"
+    # warnings on every invocation.
     command: >
-      sh -c 'exec stomp-server-go --port 8080 $${QUEUE_DB:+--queue-db "$$QUEUE_DB"}'
+      sh -c 'exec stomp-server-go --port 8080 $${QUEUE_DB:+--queue-db "$$QUEUE_DB"} $${WATCH_PELICAN_URL:+--pelican-url "$$WATCH_PELICAN_URL" --pelican-state-file "$$WATCH_PELICAN_STATE_FILE"}'
     environment:
       QUEUE_DB: /etc/data/queue.sqlite
       TEST_EVENT_SEQ_FILE: /etc/data/seq.txt
+      WATCH_PELICAN_URL: osdf://vdc/public/pelican_protocol
+      WATCH_PELICAN_STATE_FILE: /etc/data/pelican-seen.txt
     ports:
       - "8080:8080"
     volumes:
@@ -20,9 +31,12 @@ services:
 
   client:
     build: ./stomp-client
-    # event-source must match whichever event source the server is actually
-    # running (see the server service above): the seq-file one, since
-    # TEST_EVENT_SEQ_FILE is set unconditionally there.
+    # --event-source is just a free-form suffix of this client's own
+    # destination (<client_id>/<event-source>); the server delivers to
+    # whatever destination a client subscribes to regardless of which
+    # EventSource it's actually running, so this name need not match
+    # anything server-side. With WATCH_PELICAN_URL set on the server above, this
+    # client will receive Pelican new-file JSON events instead of seq numbers.
     command: python client.py --event-source seq-events --client-id playground-client --reconnect --log-level ${LOG_LEVEL:-INFO}
     environment:
       STOMP_URL: ws://server:8080

@@ -27,6 +27,10 @@ func main() {
 	debug := flag.Bool("debug", false, "log full frame contents (headers and body) for every frame")
 	htpasswdFile := flag.String("htpasswd", "", "path to an htpasswd file; if absent, connections are unauthenticated")
 	queueDB := flag.String("queue-db", "", "path to a SQLite database file for durable, on-disk client queues; if absent, queues are kept in memory only")
+	pelicanURL := flag.String("pelican-url", "", "Pelican federation URL of a directory to watch for new files (e.g. osdf://vdc/public/pelican_protocol); if set, this is the event source instead of the demo ticker")
+	pelicanPollInterval := flag.Duration("pelican-poll-interval", time.Minute, "how often to poll --pelican-url")
+	pelicanStateFile := flag.String("pelican-state-file", "", "path to a file recording the last-observed directory listing, so a restart doesn't re-announce every existing file as new (required if --pelican-url is set)")
+	pelicanBinary := flag.String("pelican-binary", "pelican", "path to the pelican CLI binary used to list --pelican-url")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -64,10 +68,23 @@ func main() {
 		logger.Info("using in-memory client queues")
 	}
 
-	// Exactly one demo event source: the persistent, file-backed one if
-	// TEST_EVENT_SEQ_FILE is set, otherwise the plain in-memory ticker.
+	// Exactly one event source is ever active: the Pelican directory watcher
+	// if --pelican-url is set, else the persistent file-backed demo source if
+	// TEST_EVENT_SEQ_FILE is set, else the plain in-memory demo ticker.
 	var source EventSource
-	if seqFile := os.Getenv("TEST_EVENT_SEQ_FILE"); seqFile != "" {
+	if *pelicanURL != "" {
+		if *pelicanStateFile == "" {
+			logger.Error("--pelican-state-file is required when --pelican-url is set")
+			os.Exit(1)
+		}
+		pelicanSource, err := newPelicanListingEventSource(*pelicanURL, *pelicanPollInterval, *pelicanStateFile, *pelicanBinary, logger)
+		if err != nil {
+			logger.Error("failed to start Pelican directory listing watcher", "url", *pelicanURL, "error", err)
+			os.Exit(1)
+		}
+		source = pelicanSource
+		logger.Info("watching Pelican directory listing", "url", *pelicanURL, "poll-interval", *pelicanPollInterval, "state-file", *pelicanStateFile)
+	} else if seqFile := os.Getenv("TEST_EVENT_SEQ_FILE"); seqFile != "" {
 		seqSource, err := newSeqFileEventSource(seqFile, eventInterval, logger)
 		if err != nil {
 			logger.Error("failed to start persistent sequence event source", "path", seqFile, "error", err)
