@@ -4,7 +4,7 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>STOMP Server UI</title>
   <style>
-    :root{color-scheme:dark;--bg:#10151c;--panel:#18212c;--line:#2b3948;--muted:#91a2b5;--green:#54d68a;--blue:#73b8ff;--red:#ff8b8b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf4fb;font:14px system-ui,sans-serif}main{max-width:1100px;margin:auto;padding:32px 20px}h1{margin:0 0 6px}p{color:var(--muted)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-top:18px}.form{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:grid;gap:5px;color:var(--muted)}input{background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px}button{background:var(--green);border:0;border-radius:6px;padding:10px 14px;font-weight:700;cursor:pointer}button.secondary{background:#344454;color:#fff}.actions{display:flex;gap:10px;align-items:center;margin-top:14px}.status{margin-left:auto;color:var(--muted)}.connected{color:var(--green)}.error{color:var(--red)}.steps{display:grid;gap:8px}.step{border-left:3px solid var(--line);padding:8px 12px;background:#111820;color:var(--muted)}.step.active{border-color:var(--green);color:#edf4fb}.step strong{color:var(--blue)}pre{max-height:360px;min-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d131a;border:1px solid var(--line);border-radius:7px;padding:12px;font:12px ui-monospace,monospace;color:#c9e4ff}@media(max-width:750px){.grid{grid-template-columns:1fr}.form{grid-template-columns:1fr}.status{margin-left:0}}
+    :root{color-scheme:dark;--bg:#10151c;--panel:#18212c;--line:#2b3948;--muted:#91a2b5;--green:#54d68a;--blue:#73b8ff;--red:#ff8b8b}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#edf4fb;font:14px system-ui,sans-serif}main{max-width:1100px;margin:auto;padding:32px 20px}h1{margin:0 0 6px}p{color:var(--muted)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-top:18px}.form{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:grid;gap:5px;color:var(--muted)}input{background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px}button{background:var(--green);border:0;border-radius:6px;padding:10px 14px;font-weight:700;cursor:pointer}button.secondary{background:#344454;color:#fff}.actions{display:flex;gap:10px;align-items:center;margin-top:14px}.status{margin-left:auto;color:var(--muted)}.connected{color:var(--green)}.error{color:var(--red)}.steps{display:grid;gap:8px}.step{border-left:3px solid var(--line);padding:8px 12px;background:#111820;color:var(--muted)}.step.active{border-color:var(--green);color:#edf4fb}.step strong{color:var(--blue)}pre{max-height:360px;min-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#0d131a;border:1px solid var(--line);border-radius:7px;padding:12px;font:12px ui-monospace,monospace;color:#c9e4ff}.report-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:8px;overflow:hidden}.report-grid div{padding:13px;border-right:1px solid var(--line);border-bottom:1px solid var(--line);min-width:0}.report-grid div:nth-child(4n){border-right:0}.report-grid div:nth-last-child(-n+4){border-bottom:0}.report-grid dt{font-size:12px;color:var(--muted);margin-bottom:5px}.report-grid dd{font:600 18px system-ui,sans-serif;margin:0;overflow-wrap:anywhere}.report-note{margin:14px 0 0;color:var(--muted);line-height:1.5;font-size:13px}@media(max-width:750px){.grid{grid-template-columns:1fr}.form{grid-template-columns:1fr}.status{margin-left:0}.report-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.report-grid div:nth-child(4n){border-right:1px solid var(--line)}.report-grid div:nth-child(2n){border-right:0}.report-grid div:nth-last-child(-n+4){border-bottom:1px solid var(--line)}.report-grid div:nth-last-child(-n+2){border-bottom:0}}
   </style>
 </head>
 <body><main>
@@ -12,11 +12,34 @@
   <p>Server-side observer and publisher. The actual STOMP server remains the separate container listening on port 8080; this UI connects as an inspection subscription and auto-ACKs every message, so it stays compatible with the message-queue app's ack-gated delivery. If the server was started with <code>--htpasswd</code>, fill in Username/Password to authenticate.</p>
   <section class="card"><h2>Transport and negotiation</h2><div class="steps"><div id="http" class="step"><strong>1. HTTP</strong> — browser requests WebSocket Upgrade</div><div id="upgrade" class="step"><strong>2. HTTP 101</strong> — server accepts the protocol upgrade</div><div id="ws" class="step"><strong>3. WebSocket</strong> — bidirectional transport is open</div><div id="stomp" class="step"><strong>4. STOMP 1.2</strong> — CONNECT / CONNECTED / SUBSCRIBE</div><div id="heartbeat" class="step"><strong>5. Heartbeats</strong> — LF frames keep the connection alive</div></div></section>
   <section class="card"><div class="form"><label>Server WebSocket URL<input id="url" value="ws://localhost:8080"></label><label>Subscription ID<input id="subscription" value="server-observer"></label><label>Destination<input id="destination" value="server-observer/demo-events"></label><label>Username (if --htpasswd)<input id="username" placeholder="leave blank for no auth"></label><label>Password<input id="password" type="password"></label></div><div class="actions"><button id="connect">Observe server</button><button id="disconnect" class="secondary">Disconnect</button><span id="status" class="status">Disconnected</span></div></section>
+  <section class="card">
+    <h2>Server metrics</h2>
+    <p>Polled directly from the message-queue app's Prometheus <code>/metrics</code> endpoint (same host as the WebSocket URL above). Starts once you click "Observe server" below, and then keeps polling independently of the WebSocket connection's own state.</p>
+    <dl class="report-grid">
+      <div><dt>Active queues</dt><dd id="m-active-queues">—</dd></div>
+      <div><dt>Queued events</dt><dd id="m-queued-events">—</dd></div>
+      <div><dt>Subscriptions accepted</dt><dd id="m-sub-accepted">—</dd></div>
+      <div><dt>Subscriptions rejected</dt><dd id="m-sub-rejected">—</dd></div>
+      <div><dt>Events enqueued</dt><dd id="m-events-enqueued">—</dd></div>
+      <div><dt>Events dropped</dt><dd id="m-events-dropped">—</dd></div>
+      <div><dt>Overflows (connected)</dt><dd id="m-overflow-connected">—</dd></div>
+      <div><dt>Overflows (offline)</dt><dd id="m-overflow-offline">—</dd></div>
+      <div><dt>Messages published</dt><dd id="m-published">—</dd></div>
+      <div><dt>Retries attempted</dt><dd id="m-retries">—</dd></div>
+      <div><dt>Acks received</dt><dd id="m-acks">—</dd></div>
+      <div><dt>Avg ack latency</dt><dd id="m-ack-latency">—</dd></div>
+      <div><dt>Disconnects (retry exhausted)</dt><dd id="m-disc-retry">—</dd></div>
+      <div><dt>Disconnects (queue overflow)</dt><dd id="m-disc-overflow">—</dd></div>
+      <div><dt>Queue errors</dt><dd id="m-queue-errors">—</dd></div>
+      <div><dt>Metrics last updated</dt><dd id="m-updated">—</dd></div>
+    </dl>
+    <p id="metrics-note" class="report-note">Click "Observe server" to start polling.</p>
+  </section>
   <div class="grid"><section class="card"><h2>Publish test event</h2><p>This sends a STOMP <code>SEND</code> frame through the server. Connected clients subscribed to this destination will receive a <code>MESSAGE</code>.</p><label>Payload<textarea id="payload" rows="5" style="width:100%;margin-top:5px;background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px;font:12px ui-monospace,monospace">{"source":"server-ui","message":"hello from the server-side demo"}</textarea></label><div class="actions"><button id="send">Send event</button></div></section><section class="card"><h2>Raw frames</h2><pre id="frames">No frames yet.</pre></section></div>
   <section class="card"><h2>Activity</h2><pre id="log">Ready.</pre></section>
 </main>
 <script>
-const $=id=>document.getElementById(id);let socket=null,heartbeatTimer=null;
+const $=id=>document.getElementById(id);let socket=null,heartbeatTimer=null,metricsTimer=null;
 function log(x){$('log').textContent+=`\n${new Date().toLocaleTimeString()} ${x}`;$('log').scrollTop=$('log').scrollHeight}
 function mark(id){$(id).classList.add('active')}
 function status(x,k=''){$('status').textContent=x;$('status').className='status '+k}
@@ -34,8 +57,66 @@ function httpUrl(value){const url=new URL(value,window.location.href);if(url.pro
 // for the realm. The WebSocket handshake to the same origin right after
 // then picks up those cached credentials with no separate login prompt.
 function authProbe(url,user,pass){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('GET',url,true,user,pass);xhr.onload=()=>xhr.status===401?reject(new Error('server rejected credentials (401)')):resolve();xhr.onerror=()=>reject(new Error('auth probe request failed'));xhr.send()})}
-async function connect(){if(socket&&socket.readyState<2)socket.close();mark('http');const target=websocketUrl($('url').value);const user=$('username').value,pass=$('password').value;status('Connecting…');if(user){const probeUrl=httpUrl($('url').value);log('HTTP REQUEST → GET '+probeUrl+' (Basic auth preflight, so the browser caches credentials before the WebSocket handshake)');try{await authProbe(probeUrl,user,pass);log('Basic auth accepted for '+user)}catch(e){status('Auth failed','error');log('Basic auth preflight failed: '+e.message);return}}log('HTTP REQUEST → GET '+target+' with Upgrade: websocket');socket=new WebSocket(target);socket.binaryType='arraybuffer';socket.onopen=()=>{mark('upgrade');mark('ws');status('WebSocket open','connected');log('HTTP RESPONSE ← 101 Switching Protocols');log('WebSocket transport established');const ms=10000;send('CONNECT',{'accept-version':'1.2',host:'playground','heart-beat':`${ms},${ms}`});clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>{if(socket.readyState===1){socket.send('\n');mark('heartbeat');log('SERVER UI → SERVER  HEARTBEAT (LF)')}},ms)};socket.onmessage=e=>{const text=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);if(text==='\n'){mark('heartbeat');log('SERVER → SERVER UI  HEARTBEAT (LF)');return}$('frames').textContent='SERVER → SERVER UI\n\n'+text.replace(/\0/g,'<NUL>');log('SERVER → SERVER UI\n'+text.replace(/\0/g,'<NUL>'));const f=parse(text);if(f.command==='CONNECTED'){mark('stomp');send('SUBSCRIBE',{id:$('subscription').value,subscription:$('subscription').value,destination:$('destination').value,ack:'client-individual'})}else if(f.command==='MESSAGE'&&f.headers.ack){send('ACK',{id:f.headers.ack})}};socket.onerror=()=>{status('Connection error','error');log('connection error')};socket.onclose=()=>{clearInterval(heartbeatTimer);status('Disconnected');log('connection closed')}}
+async function connect(){startMetricsPolling();if(socket&&socket.readyState<2)socket.close();mark('http');const target=websocketUrl($('url').value);const user=$('username').value,pass=$('password').value;status('Connecting…');if(user){const probeUrl=httpUrl($('url').value);log('HTTP REQUEST → GET '+probeUrl+' (Basic auth preflight, so the browser caches credentials before the WebSocket handshake)');try{await authProbe(probeUrl,user,pass);log('Basic auth accepted for '+user)}catch(e){status('Auth failed','error');log('Basic auth preflight failed: '+e.message);return}}log('HTTP REQUEST → GET '+target+' with Upgrade: websocket');socket=new WebSocket(target);socket.binaryType='arraybuffer';socket.onopen=()=>{mark('upgrade');mark('ws');status('WebSocket open','connected');log('HTTP RESPONSE ← 101 Switching Protocols');log('WebSocket transport established');const ms=10000;send('CONNECT',{'accept-version':'1.2',host:'playground','heart-beat':`${ms},${ms}`});clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>{if(socket.readyState===1){socket.send('\n');mark('heartbeat');log('SERVER UI → SERVER  HEARTBEAT (LF)')}},ms)};socket.onmessage=e=>{const text=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);if(text==='\n'){mark('heartbeat');log('SERVER → SERVER UI  HEARTBEAT (LF)');return}$('frames').textContent='SERVER → SERVER UI\n\n'+text.replace(/\0/g,'<NUL>');log('SERVER → SERVER UI\n'+text.replace(/\0/g,'<NUL>'));const f=parse(text);if(f.command==='CONNECTED'){mark('stomp');send('SUBSCRIBE',{id:$('subscription').value,subscription:$('subscription').value,destination:$('destination').value,ack:'client-individual'})}else if(f.command==='MESSAGE'&&f.headers.ack){send('ACK',{id:f.headers.ack})}};socket.onerror=()=>{status('Connection error','error');log('connection error')};socket.onclose=()=>{clearInterval(heartbeatTimer);status('Disconnected');log('connection closed')}}
 function disconnect(){clearInterval(heartbeatTimer);if(socket&&socket.readyState===1){send('DISCONNECT');setTimeout(()=>socket.close(1000,'user disconnected'),100)}else status('Disconnected')}
 function publish(){if(!socket||socket.readyState!==1){log('Send unavailable: connect first');return}let body;try{body=JSON.stringify(JSON.parse($('payload').value))}catch(e){log('Payload must be valid JSON');return}send('SEND',{destination:$('destination').value,'content-type':'application/json'},body)}
 $('connect').onclick=connect;$('disconnect').onclick=disconnect;$('send').onclick=publish;
+
+// Server metrics: polled straight from the Go server's Prometheus /metrics
+// endpoint, over plain HTTP, independent of the STOMP WebSocket connection
+// above -- this table updates whether or not "Observe server" was clicked.
+function parseMetrics(text){
+  const metrics={};
+  for(const line of text.split('\n')){
+    if(!line||line.startsWith('#'))continue;
+    const m=line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{(.*)\})?\s+(\S+)$/);
+    if(!m)continue;
+    const labels={};
+    if(m[3])for(const pair of m[3].matchAll(/(\w+)="((?:[^"\\]|\\.)*)"/g))labels[pair[1]]=pair[2].replace(/\\(.)/g,'$1');
+    (metrics[m[1]]||=[]).push({labels,value:parseFloat(m[4])});
+  }
+  return metrics;
+}
+function metricValue(metrics,name,labelFilter){
+  const series=metrics[name]||[];
+  const matching=labelFilter?series.filter(s=>Object.entries(labelFilter).every(([k,v])=>s.labels[k]===v)):series;
+  return matching.reduce((sum,s)=>sum+s.value,0);
+}
+async function pollMetrics(){
+  let target;
+  try{
+    target=new URL('metrics',httpUrl($('url').value));
+  }catch(e){
+    $('metrics-note').textContent='Metrics unavailable: '+e.message;
+    return;
+  }
+  try{
+    const res=await fetch(target,{cache:'no-store'});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const m=parseMetrics(await res.text());
+    const subAccepted=metricValue(m,'messagequeue_subscriptions_total',{outcome:'accepted'});
+    const ackLatencySum=metricValue(m,'messagequeue_ack_latency_seconds_sum');
+    const ackLatencyCount=metricValue(m,'messagequeue_ack_latency_seconds_count');
+    $('m-active-queues').textContent=metricValue(m,'messagequeue_active_queues');
+    $('m-queued-events').textContent=metricValue(m,'messagequeue_queued_events');
+    $('m-sub-accepted').textContent=subAccepted;
+    $('m-sub-rejected').textContent=metricValue(m,'messagequeue_subscriptions_total')-subAccepted;
+    $('m-events-enqueued').textContent=metricValue(m,'messagequeue_events_enqueued_total');
+    $('m-events-dropped').textContent=metricValue(m,'messagequeue_events_dropped_total');
+    $('m-overflow-connected').textContent=metricValue(m,'messagequeue_queue_overflows_total',{client_connected:'true'});
+    $('m-overflow-offline').textContent=metricValue(m,'messagequeue_queue_overflows_total',{client_connected:'false'});
+    $('m-published').textContent=metricValue(m,'messagequeue_messages_published_total');
+    $('m-retries').textContent=metricValue(m,'messagequeue_retries_total');
+    $('m-acks').textContent=metricValue(m,'messagequeue_acks_total');
+    $('m-ack-latency').textContent=ackLatencyCount>0?(ackLatencySum/ackLatencyCount*1000).toFixed(1)+' ms':'—';
+    $('m-disc-retry').textContent=metricValue(m,'messagequeue_client_disconnects_total',{reason:'retry_exhausted'});
+    $('m-disc-overflow').textContent=metricValue(m,'messagequeue_client_disconnects_total',{reason:'queue_overflow'});
+    $('m-queue-errors').textContent=metricValue(m,'messagequeue_queue_errors_total');
+    $('m-updated').textContent=new Date().toLocaleTimeString();
+    $('metrics-note').textContent='Polling '+target+' every 2s.';
+  }catch(e){
+    $('metrics-note').textContent='Metrics unavailable at '+target+': '+e.message;
+  }
+}
+function startMetricsPolling(){if(metricsTimer)return;pollMetrics();metricsTimer=setInterval(pollMetrics,2000)}
 </script></body></html>

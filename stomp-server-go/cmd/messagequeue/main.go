@@ -12,6 +12,16 @@ import (
 
 const eventInterval = 5 * time.Second
 
+// allowCORS lets any origin GET the wrapped handler's response, for
+// endpoints (like /metrics) that are read-only, unauthenticated, and meant
+// to be polled from a dashboard served on a different origin/port.
+func allowCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	port := flag.String("port", "8080", "port to listen on")
 	debug := flag.Bool("debug", false, "log full frame contents (headers and body) for every frame")
@@ -72,7 +82,10 @@ func main() {
 
 	srv := stomp.NewServer(logger)
 	app := newMessageQueueApp(srv, logger, source, newQueue)
-	mux.Handle("/metrics", app.MetricsHandler())
+	// Dashboards (e.g. server-ui) are typically served from a different
+	// origin than this server, so allow cross-origin GETs of this read-only,
+	// non-sensitive endpoint.
+	mux.Handle("/metrics", allowCORS(app.MetricsHandler()))
 
 	httpServer := &http.Server{Addr: addr, Handler: mux}
 	go func() {

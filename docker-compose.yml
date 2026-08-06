@@ -54,5 +54,12 @@ services:
       - "8000:8000"
     depends_on:
       - server
+
+  server-ui:
+    build: ./server-ui
+    ports:
+      - "8001:8000"
+    depends_on:
+      - server
 volumes:
   db-data:
