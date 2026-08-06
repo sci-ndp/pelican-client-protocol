@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import uuid
 from collections import deque
 from urllib.parse import urlparse, urlunparse
 
@@ -56,6 +57,22 @@ class StompClient:
         self.log = logging.getLogger("stomp-client")
         self.log_buffer = next((handler for handler in self.log.handlers if isinstance(handler, ClientLogBuffer)), None)
         self.message_bodies = deque(maxlen=200)
+        self.delivery_metrics = {
+            "connection_attempts": 0,
+            "sessions_established": 0,
+            "connection_failures": 0,
+            "server_error_frames": 0,
+            "messages_received": 0,
+            "unique_events_processed": 0,
+            "redeliveries_observed": 0,
+            "acks_sent": 0,
+            "acks_withheld": 0,
+            "disconnects_before_ack": 0,
+            "graceful_disconnects": 0,
+            "disconnect_receipts_received": 0,
+            "disconnect_receipt_timeouts": 0,
+            "immediate_disconnects": 0,
+        }
         self.events_seen = 0
         self.drop_ack_percent = float(os.getenv("DROP_ACK_PERCENT", "0"))
         self.disconnect_after = int(os.getenv("DISCONNECT_AFTER", "0"))
@@ -64,12 +81,17 @@ class StompClient:
         self.username = args.username
         self.password = args.password
         self.active_ws = None
+        self.pending_disconnect_receipt = None
+        self.disconnect_receipt_waiter = None
         self.enabled = True
         self.wake = asyncio.Event()
         self.connection_state = "starting"
         self.last_error = ""
         self.session_headers: dict[str, str] = {}
         self.validate_auth()
+        self.log.info(
+            "delivery report initialized scope=current client process; repeated deliveries are inferred from duplicate application event IDs",
+        )
         self.log.info(
             "configured url=%s destination=%s client_id=%s heartbeat_ms=%s reconnect=%s log_level=%s basic_auth=%s auth_username=%s drop_ack_percent=%s disconnect_after=%s",
             args.url, self.destination(), args.client_id, args.heartbeat, args.reconnect,
@@ -94,7 +116,7 @@ class StompClient:
 
     async def run(self) -> None:
         await asyncio.start_server(self.handle_http_request, "0.0.0.0", self.args.log_port)
-        self.log.info("application API listening address=0.0.0.0 port=%s paths=/logs,/messages,/status,/config,/connect,/disconnect,/disconnect/graceful,/simulation/*", self.args.log_port)
+        self.log.info("application API listening address=0.0.0.0 port=%s paths=/logs,/messages,/report,/status,/config,/connect,/disconnect,/disconnect/graceful,/simulation/*", self.args.log_port)
         delay = 1
         while True:
             if not self.enabled:
@@ -107,6 +129,13 @@ class StompClient:
                 await self.connected_session()
                 delay = 1
             except (OSError, WebSocketException, RuntimeError) as exc:
+                if not self.enabled:
+                    self.connection_state = "disconnected"
+                    self.last_error = ""
+                    self.log.info("connection closed after client-requested disconnect")
+                    delay = 1
+                    continue
+                self.delivery_metrics["connection_failures"] += 1
                 self.connection_state = "error"
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 self.log.warning("connection failure type=%s error=%s; reconnecting in %ss", type(exc).__name__, exc, delay)
@@ -121,6 +150,18 @@ class StompClient:
     def received_messages(self) -> list[str]:
         """Return recent MESSAGE bodies received by this client, oldest first."""
         return list(self.message_bodies)
+
+    def delivery_report(self) -> dict:
+        """Return a transparent account of delivery behavior observed by this client."""
+        return {
+            "scope": "Current Python client process only; counters reset when the client restarts.",
+            "metrics": dict(self.delivery_metrics),
+            "notes": {
+                "redeliveries_observed": "A repeated application event ID was delivered again. This commonly indicates server retry after an ACK was not received, but the client cannot prove why the server redelivered it.",
+                "acks_withheld": "ACKs intentionally not sent by this client because of the configured fault simulations.",
+                "unobservable": "Frames lost before reaching this client cannot be counted by the client.",
+            },
+        }
 
     def status_payload(self) -> dict:
         return {
@@ -183,20 +224,55 @@ class StompClient:
             await self.active_ws.close(code=4000, reason="configuration updated")
 
     async def graceful_disconnect(self) -> None:
-        """End the active STOMP session by sending DISCONNECT before closing WebSocket."""
-        self.enabled = False
-        self.connection_state = "disconnecting"
-        self.last_error = ""
+        """Send DISCONNECT with a receipt request, then close after the matching RECEIPT."""
+        if self.pending_disconnect_receipt:
+            raise RuntimeError("a graceful disconnect is already in progress")
         if self.active_ws is None:
+            self.enabled = False
             self.connection_state = "disconnected"
             self.log.info("graceful disconnect requested with no active STOMP session")
             return
+
+        ws = self.active_ws
+        receipt_id = f"disconnect-{uuid.uuid4()}"
+        waiter = asyncio.get_running_loop().create_future()
+        self.pending_disconnect_receipt = receipt_id
+        self.disconnect_receipt_waiter = waiter
+        self.connection_state = "disconnecting"
+        self.last_error = ""
+        self.delivery_metrics["graceful_disconnects"] += 1
+        received = False
         try:
-            await self.send(self.active_ws, Frame("DISCONNECT", {}))
-            self.log.info("graceful STOMP DISCONNECT sent; closing WebSocket")
-            await self.active_ws.close(code=1000, reason="graceful client disconnect")
+            await self.send(ws, Frame("DISCONNECT", {"receipt": receipt_id}))
+            self.log.info("graceful STOMP DISCONNECT sent receipt=%s; waiting for RECEIPT", receipt_id)
+            received = await asyncio.wait_for(asyncio.shield(waiter), timeout=5)
+            if received:
+                self.log.info("graceful disconnect receipt confirmed receipt=%s", receipt_id)
+            else:
+                self.delivery_metrics["disconnect_receipt_timeouts"] += 1
+                self.log.warning("graceful disconnect ended before receipt=%s was confirmed", receipt_id)
+        except asyncio.TimeoutError:
+            self.delivery_metrics["disconnect_receipt_timeouts"] += 1
+            self.log.warning("graceful disconnect timed out waiting for receipt=%s", receipt_id)
         finally:
+            self.enabled = False
+            if not received and self.active_ws is ws:
+                await ws.close(code=1000, reason="graceful client disconnect")
+            if self.pending_disconnect_receipt == receipt_id:
+                self.pending_disconnect_receipt = None
+                self.disconnect_receipt_waiter = None
             self.session_headers = {}
+
+    def handle_receipt(self, frame: Frame) -> None:
+        receipt_id = frame.headers.get("receipt-id", "")
+        if receipt_id == self.pending_disconnect_receipt and self.disconnect_receipt_waiter is not None:
+            if not self.disconnect_receipt_waiter.done():
+                self.disconnect_receipt_waiter.set_result(True)
+            self.enabled = False
+            self.delivery_metrics["disconnect_receipts_received"] += 1
+            self.log.info("server receipt matched graceful disconnect receipt=%s", receipt_id)
+        else:
+            self.log.info("server receipt received receipt=%s", receipt_id or "(missing)")
 
     def configure_simulation(self, payload: dict) -> None:
         path = payload.get("path")
@@ -246,6 +322,8 @@ class StompClient:
                 response, status = {"logs": self.log_buffer.snapshot() if self.log_buffer else []}, "200 OK"
             elif method == "GET" and path == "/messages":
                 response, status = {"messages": self.received_messages()}, "200 OK"
+            elif method == "GET" and path == "/report":
+                response, status = self.delivery_report(), "200 OK"
             elif method == "GET" and path == "/status":
                 response, status = self.status_payload(), "200 OK"
             elif method == "POST" and path == "/config":
@@ -257,6 +335,7 @@ class StompClient:
                 response, status = self.status_payload(), "200 OK"
             elif method == "POST" and path == "/disconnect":
                 self.enabled = False
+                self.delivery_metrics["immediate_disconnects"] += 1
                 if self.active_ws is not None:
                     await self.active_ws.close(code=1000, reason="client disabled by application API")
                 response, status = self.status_payload(), "200 OK"
@@ -267,6 +346,7 @@ class StompClient:
                 action = path.removeprefix("/simulation/")
                 if action == "close-connection":
                     if self.active_ws is not None:
+                        self.delivery_metrics["immediate_disconnects"] += 1
                         self.log.warning("simulation requested immediate connection close")
                         await self.active_ws.close(code=4001, reason="simulation requested connection close")
                 else:
@@ -294,6 +374,7 @@ class StompClient:
 
     async def connected_session(self) -> None:
         target = websocket_url(self.args.url)
+        self.delivery_metrics["connection_attempts"] += 1
         self.connection_state = "connecting"
         self.last_error = ""
         self.log.info("opening WebSocket url=%s", target)
@@ -308,6 +389,7 @@ class StompClient:
                 if connected.command != "CONNECTED":
                     raise RuntimeError(f"expected CONNECTED, got {connected.command}")
                 self.session_headers = connected.headers
+                self.delivery_metrics["sessions_established"] += 1
                 self.connection_state = "connected"
                 self.log.info("STOMP session established headers=%s", connected.headers)
                 subscription_id = self.subscription_key()
@@ -318,12 +400,16 @@ class StompClient:
                     frame = await self.receive(ws)
                     if frame.command == "MESSAGE":
                         await self.on_message(ws, frame)
+                    elif frame.command == "RECEIPT":
+                        self.handle_receipt(frame)
                     elif frame.command == "ERROR":
+                        self.delivery_metrics["server_error_frames"] += 1
                         self.log.error("server ERROR: %s", frame.body or frame.headers.get("message"))
         finally:
             self.active_ws = None
-            if self.enabled:
-                self.connection_state = "disconnected"
+            if self.disconnect_receipt_waiter is not None and not self.disconnect_receipt_waiter.done():
+                self.disconnect_receipt_waiter.set_result(False)
+            self.connection_state = "disconnected"
 
     async def send(self, ws, frame: Frame) -> None:
         raw = frame.encode()
@@ -345,27 +431,34 @@ class StompClient:
 
     async def on_message(self, ws, frame: Frame) -> None:
         self.events_seen += 1
+        self.delivery_metrics["messages_received"] += 1
         self.message_bodies.append(frame.body)
         destination = frame.headers.get("destination", "")
         event_id = self.application_event_id(frame)
         if self.state.record_event(event_id, destination, frame.body):
+            self.delivery_metrics["unique_events_processed"] += 1
             self.log.info("application event processed event_id=%s destination=%s body=%s", event_id, destination, frame.body)
         else:
-            self.log.info("application duplicate ignored event_id=%s destination=%s", event_id, destination)
+            self.delivery_metrics["redeliveries_observed"] += 1
+            self.log.info("application duplicate observed event_id=%s destination=%s", event_id, destination)
         ack_id = frame.headers.get("ack")
         if ack_id:
             if self.disconnect_next_messages:
                 self.disconnect_next_messages -= 1
+                self.delivery_metrics["disconnects_before_ack"] += 1
                 self.log.warning("simulation disconnecting before ACK event_id=%s pending_disconnects=%s", event_id, self.disconnect_next_messages)
                 await ws.close(code=4001, reason="simulation disconnect before ACK")
                 return
             if self.drop_next_acks:
                 self.drop_next_acks -= 1
+                self.delivery_metrics["acks_withheld"] += 1
                 self.log.warning("simulation dropped ACK event_id=%s pending_drop_acks=%s", event_id, self.drop_next_acks)
             elif random.random() < self.drop_ack_percent / 100:
+                self.delivery_metrics["acks_withheld"] += 1
                 self.log.warning("random ACK-loss simulation dropped ACK event_id=%s percent=%s", event_id, self.drop_ack_percent)
             else:
                 await self.send(ws, Frame("ACK", {"id": ack_id}))
+                self.delivery_metrics["acks_sent"] += 1
         if self.disconnect_after and self.events_seen >= self.disconnect_after:
             await ws.close()
 
