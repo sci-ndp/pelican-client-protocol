@@ -55,6 +55,9 @@ type inFlightDelivery struct {
 // subscription state. Each client gets a durable, per-client event queue
 // (keyed by its `subscription` header, surviving reconnects) drained one
 // message at a time with ack-gated, exponentially-backed-off retries.
+// Deliveries always go back to whatever destination the client's SUBSCRIBE
+// actually named -- there is no required relationship between that
+// destination and the client's `subscription` header value.
 type messageQueueApp struct {
 	srv      stomp.StompServer
 	log      *slog.Logger
@@ -62,9 +65,11 @@ type messageQueueApp struct {
 	cfg      messageQueueConfig
 	newQueue queueFactory
 
-	mu        sync.Mutex
-	queues    map[string]clientQueue      // client's `subscription` header value -> queue
-	inFlights map[string]*inFlightDelivery // client's `subscription` header value -> in-flight delivery, if any
+	mu           sync.Mutex
+	queues       map[string]clientQueue       // client's `subscription` header value -> queue
+	inFlights    map[string]*inFlightDelivery // client's `subscription` header value -> in-flight delivery, if any
+	destinations map[string]string            // client's `subscription` header value -> destination it last subscribed to
+	clientIDs    map[string]string            // destination -> client's `subscription` header value (reverse of destinations)
 }
 
 // newMessageQueueApp registers itself as a subscriber to srv's SUBSCRIBE and
@@ -76,13 +81,15 @@ func newMessageQueueApp(srv stomp.StompServer, log *slog.Logger, source EventSou
 
 func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, source EventSource, cfg messageQueueConfig, newQueue queueFactory) *messageQueueApp {
 	a := &messageQueueApp{
-		srv:       srv,
-		log:       log,
-		source:    source,
-		cfg:       cfg,
-		newQueue:  newQueue,
-		queues:    map[string]clientQueue{},
-		inFlights: map[string]*inFlightDelivery{},
+		srv:          srv,
+		log:          log,
+		source:       source,
+		cfg:          cfg,
+		newQueue:     newQueue,
+		queues:       map[string]clientQueue{},
+		inFlights:    map[string]*inFlightDelivery{},
+		destinations: map[string]string{},
+		clientIDs:    map[string]string{},
 	}
 	srv.OnSubscribe(a.onSubscribe)
 	srv.OnAck(a.onAck)
@@ -98,18 +105,6 @@ func (a *messageQueueApp) run() {
 	for event := range a.source.Events() {
 		a.onEvent(event)
 	}
-}
-
-func (a *messageQueueApp) destination(clientID string) string {
-	return clientID + "/" + a.source.Name()
-}
-
-func (a *messageQueueApp) clientIDFromDestination(destination string) (string, bool) {
-	suffix := "/" + a.source.Name()
-	if !strings.HasSuffix(destination, suffix) {
-		return "", false
-	}
-	return strings.TrimSuffix(destination, suffix), true
 }
 
 // clearInFlight stops and forgets clientID's in-flight delivery, if any.
@@ -144,7 +139,7 @@ func (a *messageQueueApp) onEvent(event string) {
 			a.log.Error("queue enqueue failed", "subscription", clientID, "error", err)
 			continue
 		}
-		destination := a.destination(clientID)
+		destination := a.destinations[clientID]
 		connected := a.srv.Connected(destination)
 		if overflowed && connected {
 			a.clearInFlight(clientID)
@@ -166,15 +161,38 @@ func (a *messageQueueApp) onEvent(event string) {
 	}
 }
 
+// hasOwningSegment reports whether destination's first "/"-delimited segment
+// is exactly clientID -- i.e. destination is clientID itself, or
+// "<clientID>/<anything>". This is what stops one client from subscribing to
+// a destination namespaced under a different client's id.
+func hasOwningSegment(destination, clientID string) bool {
+	segment := destination
+	if idx := strings.IndexByte(destination, '/'); idx >= 0 {
+		segment = destination[:idx]
+	}
+	return segment == clientID
+}
+
 // onSubscribe creates a new event queue the first time a client's
 // `subscription` header is seen, or resumes the existing one if it matches a
 // queue kept around from an earlier connection. Either way, any leftover
-// retry state is cleared so this connection's retry loop starts fresh.
+// retry state is cleared so this connection's retry loop starts fresh, and
+// the client's destination is (re)recorded as wherever this SUBSCRIBE named
+// -- future deliveries for this client always go back there, regardless of
+// what it was on a previous connection. The destination's first path segment
+// must be the client's own subscription id (any suffix after that is free
+// choice), so one client can never subscribe to a destination namespaced
+// under a different client's id.
 func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	clientID := headers["subscription"]
 	destination := headers["destination"]
 	if clientID == "" || destination == "" {
 		a.log.Warn("SUBSCRIBE missing subscription/destination header; ignoring", "headers", headers)
+		return
+	}
+	if !hasOwningSegment(destination, clientID) {
+		a.log.Warn("SUBSCRIBE destination does not start with the client's own subscription id; ignoring",
+			"subscription", clientID, "destination", destination)
 		return
 	}
 	if ack := headers["ack"]; ack != "client-individual" {
@@ -183,6 +201,12 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	}
 
 	a.mu.Lock()
+	if old, ok := a.destinations[clientID]; ok && old != destination {
+		delete(a.clientIDs, old)
+	}
+	a.destinations[clientID] = destination
+	a.clientIDs[destination] = clientID
+
 	q, existed := a.queues[clientID]
 	if !existed {
 		q = a.newQueue(clientID)
@@ -226,18 +250,18 @@ func (a *messageQueueApp) tryDeliver(clientID string) {
 	}
 	inFlight := &inFlightDelivery{messageID: uuid.NewString(), delay: a.cfg.initialRetryDelay}
 	a.inFlights[clientID] = inFlight
+	destination := a.destinations[clientID]
 	a.mu.Unlock()
 
-	a.sendAndArm(clientID, body, inFlight)
+	a.sendAndArm(clientID, destination, body, inFlight)
 }
 
-// sendAndArm publishes body and arms inFlight's retry timer. The timer is
-// created and assigned to inFlight.timer while holding a.mu so that, even if
-// the timer fires immediately (possible with a very short retry delay), its
-// callback -- which locks a.mu as its first action -- cannot observe
-// inFlight.timer before this assignment completes.
-func (a *messageQueueApp) sendAndArm(clientID, body string, inFlight *inFlightDelivery) {
-	destination := a.destination(clientID)
+// sendAndArm publishes body to destination and arms inFlight's retry timer.
+// The timer is created and assigned to inFlight.timer while holding a.mu so
+// that, even if the timer fires immediately (possible with a very short
+// retry delay), its callback -- which locks a.mu as its first action --
+// cannot observe inFlight.timer before this assignment completes.
+func (a *messageQueueApp) sendAndArm(clientID, destination, body string, inFlight *inFlightDelivery) {
 	if err := a.srv.Publish(destination, inFlight.messageID, body); err != nil {
 		a.log.Error("publish failed", "destination", destination, "error", err)
 	}
@@ -261,8 +285,8 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 	}
 	if inFlight.attempt >= a.cfg.maxRetries {
 		delete(a.inFlights, clientID)
+		destination := a.destinations[clientID]
 		a.mu.Unlock()
-		destination := a.destination(clientID)
 		a.log.Warn("retry budget exhausted; disconnecting client", "subscription", clientID, "destination", destination)
 		if err := a.srv.Disconnect(destination); err != nil {
 			a.log.Error("disconnect failed", "destination", destination, "error", err)
@@ -272,6 +296,7 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 	inFlight.attempt++
 	inFlight.delay = time.Duration(float64(inFlight.delay) * a.cfg.retryBackoffFactor)
 	body, hasEvent, err := q.PeekFront()
+	destination := a.destinations[clientID]
 	a.mu.Unlock()
 	if err != nil {
 		a.log.Error("queue peek failed", "subscription", clientID, "error", err)
@@ -281,7 +306,7 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 		return
 	}
 
-	a.sendAndArm(clientID, body, inFlight)
+	a.sendAndArm(clientID, destination, body, inFlight)
 }
 
 // onAck resolves the in-flight delivery it corresponds to (if any) and
@@ -289,13 +314,14 @@ func (a *messageQueueApp) onRetryTimeout(clientID string, inFlight *inFlightDeli
 // -- because it was already superseded by a retry, a fresh resubscribe, or
 // this is a duplicate/stale ack for an unrelated destination -- are ignored.
 func (a *messageQueueApp) onAck(headers map[string]string) {
-	clientID, ok := a.clientIDFromDestination(headers["destination"])
-	if !ok {
-		return // not one of ours
-	}
 	messageID := headers["message-id"]
 
 	a.mu.Lock()
+	clientID, ok := a.clientIDs[headers["destination"]]
+	if !ok {
+		a.mu.Unlock()
+		return // not one of ours
+	}
 	q, ok := a.queues[clientID]
 	inFlight := a.inFlights[clientID]
 	if !ok || inFlight == nil || inFlight.messageID != messageID {

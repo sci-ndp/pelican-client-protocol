@@ -10,7 +10,7 @@ import (
 func TestSeqFileEventSource_StartsAtOneWhenFileMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seq.txt")
 
-	s, err := newSeqFileEventSourceState("seq-events", path, discardLogger())
+	s, err := newSeqFileEventSourceState(path, discardLogger())
 	if err != nil {
 		t.Fatalf("newSeqFileEventSourceState: %v", err)
 	}
@@ -33,7 +33,7 @@ func TestSeqFileEventSource_ResumesFromExistingFile(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 
-	s, err := newSeqFileEventSourceState("seq-events", path, discardLogger())
+	s, err := newSeqFileEventSourceState(path, discardLogger())
 	if err != nil {
 		t.Fatalf("newSeqFileEventSourceState: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestSeqFileEventSource_TreatsEmptyFileAsZero(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 
-	s, err := newSeqFileEventSourceState("seq-events", path, discardLogger())
+	s, err := newSeqFileEventSourceState(path, discardLogger())
 	if err != nil {
 		t.Fatalf("newSeqFileEventSourceState: %v", err)
 	}
@@ -71,7 +71,7 @@ func TestSeqFileEventSource_RejectsCorruptFile(t *testing.T) {
 		t.Fatalf("seed file: %v", err)
 	}
 
-	if _, err := newSeqFileEventSourceState("seq-events", path, discardLogger()); err == nil {
+	if _, err := newSeqFileEventSourceState(path, discardLogger()); err == nil {
 		t.Fatal("expected newSeqFileEventSourceState to reject a corrupt sequence file")
 	}
 }
@@ -84,7 +84,7 @@ func TestSeqFileEventSource_ResumesAcrossSuccessiveInstances(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seq.txt")
 
 	for i, want := range []string{"Persistent Event 1", "Persistent Event 2", "Persistent Event 3"} {
-		s, err := newSeqFileEventSourceState("seq-events", path, discardLogger())
+		s, err := newSeqFileEventSourceState(path, discardLogger())
 		if err != nil {
 			t.Fatalf("instance %d: newSeqFileEventSourceState: %v", i, err)
 		}
@@ -108,7 +108,7 @@ func TestSeqFileEventSource_RealTickerWiring(t *testing.T) {
 	}
 	path := filepath.Join(dir, "seq.txt")
 
-	s, err := newSeqFileEventSource("seq-events", path, time.Millisecond, discardLogger())
+	s, err := newSeqFileEventSource(path, time.Millisecond, discardLogger())
 	if err != nil {
 		t.Fatalf("newSeqFileEventSource: %v", err)
 	}

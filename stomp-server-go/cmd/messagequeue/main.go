@@ -67,7 +67,7 @@ func main() {
 	// TEST_EVENT_SEQ_FILE is set, otherwise the plain in-memory ticker.
 	var source EventSource
 	if seqFile := os.Getenv("TEST_EVENT_SEQ_FILE"); seqFile != "" {
-		seqSource, err := newSeqFileEventSource("seq-events", seqFile, eventInterval, logger)
+		seqSource, err := newSeqFileEventSource(seqFile, eventInterval, logger)
 		if err != nil {
 			logger.Error("failed to start persistent sequence event source", "path", seqFile, "error", err)
 			os.Exit(1)
@@ -75,7 +75,7 @@ func main() {
 		source = seqSource
 		logger.Info("using persistent sequence event source", "TEST_EVENT_SEQ_FILE", seqFile)
 	} else {
-		source = newTickerEventSource("demo-events", eventInterval)
+		source = newTickerEventSource(eventInterval)
 		logger.Info("using in-memory demo ticker event source")
 	}
 

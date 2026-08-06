@@ -94,20 +94,18 @@ func (f *fakeStompServer) snapshotDisconnects() []string {
 // directly instead, since that avoids any timing dependency on the app's
 // background run() goroutine.
 type fakeEventSource struct {
-	name string
-	ch   chan string
+	ch chan string
 }
 
-func newFakeEventSource(name string) *fakeEventSource {
-	return &fakeEventSource{name: name, ch: make(chan string, 1)}
+func newFakeEventSource() *fakeEventSource {
+	return &fakeEventSource{ch: make(chan string, 1)}
 }
 
-func (f *fakeEventSource) Name() string         { return f.name }
 func (f *fakeEventSource) Events() <-chan string { return f.ch }
 
 func newTestApp(cfg messageQueueConfig) (*messageQueueApp, *fakeStompServer) {
 	srv := newFakeStompServer()
-	source := newFakeEventSource("testsource")
+	source := newFakeEventSource()
 	app := newMessageQueueAppWithConfig(srv, discardLogger(), source, cfg, newMemoryClientQueue)
 	return app, srv
 }
@@ -226,6 +224,135 @@ func TestOnSubscribe_ResumesExistingQueueAcrossReconnect(t *testing.T) {
 	}
 	if publishes[0].messageID == publishes[1].messageID {
 		t.Error("resumed delivery reused the pre-disconnect message id; retry state should reset on resubscribe")
+	}
+}
+
+func TestOnSubscribe_DeliversToWhateverDestinationClientSubscribedTo(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	// An arbitrary suffix -- not the old single <event-source-name> segment --
+	// but still owned by "alice", satisfying the first-segment-must-match rule.
+	const destination = "alice/totally/unrelated/nested/path"
+	srv.setConnected(destination, true)
+
+	app.onSubscribe(map[string]string{
+		"subscription": "alice",
+		"destination":  destination,
+		"ack":          "client-individual",
+	})
+	app.onEvent("Event 1")
+
+	publishes := srv.snapshotPublishes()
+	if len(publishes) != 1 {
+		t.Fatalf("Publish calls = %d, want 1", len(publishes))
+	}
+	if publishes[0].destination != destination {
+		t.Errorf("destination = %q, want %q (whatever the client subscribed to, not a derived convention)", publishes[0].destination, destination)
+	}
+
+	app.onAck(map[string]string{"destination": destination, "message-id": publishes[0].messageID})
+	app.onEvent("Event 2")
+
+	second := srv.snapshotPublishes()
+	if len(second) != 2 || second[1].body != "Event 2" || second[1].destination != destination {
+		t.Fatalf("expected Event 2 delivered to the same arbitrary destination after ack, got %+v", second)
+	}
+}
+
+func TestOnSubscribe_UpdatesDestinationWhenClientResubscribesElsewhere(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	const oldDestination = "alice/old-destination"
+	const newDestination = "alice/new-destination"
+	srv.setConnected(oldDestination, true)
+
+	app.onSubscribe(map[string]string{
+		"subscription": "alice",
+		"destination":  oldDestination,
+		"ack":          "client-individual",
+	})
+
+	// Reconnects with the same subscription header but a different destination.
+	srv.setConnected(newDestination, true)
+	app.onSubscribe(map[string]string{
+		"subscription": "alice",
+		"destination":  newDestination,
+		"ack":          "client-individual",
+	})
+
+	app.onEvent("Event 1")
+	publishes := srv.snapshotPublishes()
+	if len(publishes) != 1 {
+		t.Fatalf("Publish calls = %d, want 1", len(publishes))
+	}
+	if publishes[0].destination != newDestination {
+		t.Errorf("destination = %q, want the new destination %q", publishes[0].destination, newDestination)
+	}
+
+	app.mu.Lock()
+	_, staleMappingRemains := app.clientIDs[oldDestination]
+	app.mu.Unlock()
+	if staleMappingRemains {
+		t.Error("old destination -> client mapping was not cleaned up after resubscribing elsewhere")
+	}
+}
+
+func TestHasOwningSegment(t *testing.T) {
+	cases := []struct {
+		destination string
+		clientID    string
+		want        bool
+	}{
+		{"alice", "alice", true},         // bare client id, no suffix
+		{"alice/foo", "alice", true},     // client id with a suffix
+		{"alice/foo/bar", "alice", true}, // client id with a nested suffix
+		{"bob/foo", "alice", false},      // owned by a different client entirely
+		{"aliceX/foo", "alice", false},   // shares a prefix but is a different segment
+		{"alice", "aliceX", false},       // same, other direction
+		{"", "alice", false},             // empty destination
+		{"/alice/foo", "alice", false},   // leading slash makes the first segment empty
+		{"alice/", "alice", true},        // trailing slash: first segment is still "alice"
+	}
+	for _, c := range cases {
+		if got := hasOwningSegment(c.destination, c.clientID); got != c.want {
+			t.Errorf("hasOwningSegment(%q, %q) = %v, want %v", c.destination, c.clientID, got, c.want)
+		}
+	}
+}
+
+func TestOnSubscribe_RejectsDestinationNotOwnedByClient(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("bob/something", true)
+
+	app.onSubscribe(map[string]string{
+		"subscription": "alice",
+		"destination":  "bob/something",
+		"ack":          "client-individual",
+	})
+	app.onEvent("Event 1")
+
+	if got := srv.snapshotPublishes(); len(got) != 0 {
+		t.Fatalf("Publish calls = %v, want none (subscribe should have been rejected)", got)
+	}
+	app.mu.Lock()
+	_, hasQueue := app.queues["alice"]
+	app.mu.Unlock()
+	if hasQueue {
+		t.Error("a queue was created for alice despite the destination being rejected")
+	}
+}
+
+func TestOnSubscribe_RejectsDestinationWithMatchingPrefixButDifferentSegment(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("aliceX/foo", true)
+
+	app.onSubscribe(map[string]string{
+		"subscription": "alice",
+		"destination":  "aliceX/foo",
+		"ack":          "client-individual",
+	})
+	app.onEvent("Event 1")
+
+	if got := srv.snapshotPublishes(); len(got) != 0 {
+		t.Fatalf(`Publish calls = %v, want none ("aliceX/foo"'s first segment is not exactly "alice")`, got)
 	}
 }
 
@@ -390,7 +517,7 @@ func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	}
 	srv1 := newFakeStompServer()
 	srv1.setConnected("carol/testsource", true)
-	app1 := newMessageQueueAppWithConfig(srv1, discardLogger(), newFakeEventSource("testsource"), defaultMessageQueueConfig, sqliteQueueFactory(db1))
+	app1 := newMessageQueueAppWithConfig(srv1, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db1))
 	app1.onSubscribe(subscribeHeaders("carol"))
 	app1.onEvent("Event 1") // delivered but never acked
 	if got := srv1.snapshotPublishes(); len(got) != 1 {
@@ -409,7 +536,7 @@ func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	t.Cleanup(func() { db2.Close() })
 	srv2 := newFakeStompServer()
 	srv2.setConnected("carol/testsource", true)
-	app2 := newMessageQueueAppWithConfig(srv2, discardLogger(), newFakeEventSource("testsource"), defaultMessageQueueConfig, sqliteQueueFactory(db2))
+	app2 := newMessageQueueAppWithConfig(srv2, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db2))
 	app2.onSubscribe(subscribeHeaders("carol"))
 
 	publishes := srv2.snapshotPublishes()

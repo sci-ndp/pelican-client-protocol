@@ -44,7 +44,7 @@ func TestSmokeEndToEnd(t *testing.T) {
 	go srv.Serve(listener)
 	defer listener.Close()
 
-	source := newTickerEventSource("demo-events", 100*time.Millisecond)
+	source := newTickerEventSource(100 * time.Millisecond)
 	newMessageQueueApp(srv, discardLogger(), source, newMemoryClientQueue)
 
 	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
@@ -73,14 +73,18 @@ func TestSmokeEndToEnd(t *testing.T) {
 		t.Fatalf("expected CONNECTED, got %q", connected)
 	}
 
-	send("SUBSCRIBE\nid:sub-0\ndestination:alice/demo-events\nack:client-individual\nsubscription:alice\n\n")
+	// The destination deliberately does not follow the old <subscription>/
+	// <event-source-name> single-segment convention, to prove delivery just
+	// goes back to whatever was subscribed -- as long as it's still owned by
+	// "alice" (its required first path segment).
+	send("SUBSCRIBE\nid:sub-0\ndestination:alice/wherever/alice/wants\nack:client-individual\nsubscription:alice\n\n")
 
 	first := recvFrame()
 	if !strings.HasPrefix(first, "MESSAGE") {
 		t.Fatalf("expected first MESSAGE, got %q", first)
 	}
-	if got := parseHeader(first, "destination"); got != "alice/demo-events" {
-		t.Errorf("destination = %q, want %q", got, "alice/demo-events")
+	if got := parseHeader(first, "destination"); got != "alice/wherever/alice/wants" {
+		t.Errorf("destination = %q, want %q", got, "alice/wherever/alice/wants")
 	}
 	ackID := parseHeader(first, "ack")
 	if ackID == "" {
