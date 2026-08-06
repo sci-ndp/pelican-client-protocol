@@ -84,6 +84,24 @@ func testClientQueueContract(t *testing.T, newQueue func() clientQueue) {
 			t.Fatal("Enqueue() overflowed = true, want false")
 		}
 	})
+
+	t.Run("delete removes every retained event", func(t *testing.T) {
+		q := newQueue()
+		for _, e := range []string{"a", "b", "c"} {
+			if _, err := q.Enqueue(e, 100); err != nil {
+				t.Fatalf("Enqueue(%q): %v", e, err)
+			}
+		}
+		if err := q.Delete(); err != nil {
+			t.Fatalf("Delete(): %v", err)
+		}
+		if n, err := q.Len(); err != nil || n != 0 {
+			t.Fatalf("Len() after Delete() = (%d, %v), want (0, nil)", n, err)
+		}
+		if _, ok, err := q.PeekFront(); err != nil || ok {
+			t.Fatalf("PeekFront() after Delete() = (_, %v, %v), want (_, false, nil)", ok, err)
+		}
+	})
 }
 
 func TestMemoryClientQueue_Contract(t *testing.T) {
@@ -128,6 +146,34 @@ func TestSQLiteClientQueue_IsolatesByClientID(t *testing.T) {
 	}
 	if got, ok, _ := bob.PeekFront(); !ok || got != "b1" {
 		t.Errorf("bob.PeekFront() = (%q, %v), want (\"b1\", true)", got, ok)
+	}
+}
+
+func TestSQLiteClientQueue_DeleteOnlyAffectsOwnClientID(t *testing.T) {
+	db, err := openQueueDB(filepath.Join(t.TempDir(), "queue.sqlite3"))
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	factory := sqliteQueueFactory(db)
+
+	alice, bob := factory("alice"), factory("bob")
+	if _, err := alice.Enqueue("a1", 100); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := bob.Enqueue("b1", 100); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if err := alice.Delete(); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if n, _ := alice.Len(); n != 0 {
+		t.Errorf("alice.Len() after Delete() = %d, want 0", n)
+	}
+	if got, ok, _ := bob.PeekFront(); !ok || got != "b1" {
+		t.Errorf("bob.PeekFront() after alice.Delete() = (%q, %v), want (\"b1\", true) -- unaffected", got, ok)
 	}
 }
 

@@ -22,6 +22,13 @@ type clientQueue interface {
 
 	// Len reports how many events are currently queued.
 	Len() (int, error)
+
+	// Delete permanently removes every retained event for this client,
+	// including any durable on-disk rows. Unlike simply dropping the
+	// in-process handle (e.g. when a client merely disconnects, and may
+	// reconnect and resume its queue later), Delete represents the client
+	// explicitly saying it's done -- called when it UNSUBSCRIBEs.
+	Delete() error
 }
 
 // queueFactory creates the clientQueue for a client id the app has not yet
@@ -66,4 +73,9 @@ func (q *memoryClientQueue) PopFront() error {
 
 func (q *memoryClientQueue) Len() (int, error) {
 	return len(q.events), nil
+}
+
+func (q *memoryClientQueue) Delete() error {
+	q.events = nil
+	return nil
 }

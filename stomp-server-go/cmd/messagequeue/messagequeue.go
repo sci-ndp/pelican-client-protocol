@@ -90,13 +90,14 @@ func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, sourc
 		source:       source,
 		cfg:          cfg,
 		newQueue:     newQueue,
-		metrics:      newAppMetrics(),
 		queues:       map[string]clientQueue{},
 		inFlights:    map[string]*inFlightDelivery{},
 		destinations: map[string]string{},
 		clientIDs:    map[string]string{},
 	}
+	a.metrics = newAppMetrics(a)
 	srv.OnSubscribe(a.onSubscribe)
+	srv.OnUnsubscribe(a.onUnsubscribe)
 	srv.OnAck(a.onAck)
 	srv.OnDisconnect(a.onDisconnect)
 	go a.run()
@@ -130,6 +131,50 @@ func (a *messageQueueApp) clearInFlight(clientID string) {
 	}
 }
 
+// activeQueueCount implements liveQueueState.
+func (a *messageQueueApp) activeQueueCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.queues)
+}
+
+// connectedClientCount implements liveQueueState. a.clientIDs holds exactly
+// the destinations of clients this app currently considers connected: added
+// on an accepted SUBSCRIBE, removed only on an eventual onDisconnect (an
+// UNSUBSCRIBE deliberately leaves the entry in place -- see onUnsubscribe).
+func (a *messageQueueApp) connectedClientCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.clientIDs)
+}
+
+// queuedEventCount implements liveQueueState: the true total of events
+// still pending delivery, summed fresh from every live queue rather than
+// tracked incrementally. Queue snapshots are taken under a.mu, but the
+// Len() calls themselves (each a query for a durable clientQueue) run after
+// releasing it, so a slow or blocked storage backend can't stall the rest
+// of the app.
+func (a *messageQueueApp) queuedEventCount() int {
+	a.mu.Lock()
+	queues := make([]clientQueue, 0, len(a.queues))
+	for _, q := range a.queues {
+		queues = append(queues, q)
+	}
+	a.mu.Unlock()
+
+	total := 0
+	for _, q := range queues {
+		n, err := q.Len()
+		if err != nil {
+			a.log.Error("queue length check failed during metrics scrape", "error", err)
+			a.metrics.queueErrorOccurred("len")
+			continue
+		}
+		total += n
+	}
+	return total
+}
+
 // onEvent implements the fan-out and 100-cap policy: while there are no
 // registered queues, new events are dropped; once at least one exists, the
 // event is appended to every queue, capped at cfg.maxQueueLen by dropping the
@@ -157,7 +202,6 @@ func (a *messageQueueApp) onEvent(event string) {
 		destination := a.destinations[clientID]
 		connected := a.srv.Connected(destination)
 		if overflowed {
-			a.metrics.eventTrimmed()
 			a.metrics.queueOverflowed(connected)
 		}
 		if overflowed && connected {
@@ -233,7 +277,6 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 			"subscription", clientID, "ack", ack)
 	}
 	a.metrics.subscribeAccepted()
-	a.metrics.sessionStarted()
 
 	a.mu.Lock()
 	if old, ok := a.destinations[clientID]; ok && old != destination {
@@ -246,7 +289,6 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	if !existed {
 		q = a.newQueue(clientID)
 		a.queues[clientID] = q
-		a.metrics.queueCreated()
 	}
 	a.clearInFlight(clientID)
 	a.mu.Unlock()
@@ -254,19 +296,13 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	// existed only tracks whether this process has already built an
 	// in-process handle for clientID; a durable queue (e.g. sqliteClientQueue)
 	// may have events from a prior process run before this one ever saw
-	// clientID, so ask the queue itself whether there's anything to resume.
+	// clientID, so ask the queue itself whether there's anything to resume,
+	// purely for this log line -- queuedEvents itself reads straight from the
+	// queue at scrape time, so there's nothing to seed here.
 	if n, err := q.Len(); err != nil {
 		a.log.Warn("queue length check failed", "subscription", clientID, "error", err)
 		a.metrics.queueErrorOccurred("len")
 	} else if existed || n > 0 {
-		if !existed {
-			// This process just built its first in-process handle for
-			// clientID, but the durable queue already had n events from a
-			// prior process run -- seed the gauge so it isn't silently
-			// undercounted (and eventually driven negative) once they're
-			// delivered and acked.
-			a.metrics.queueResumed(n)
-		}
 		a.log.Info("resumed existing event queue", "subscription", clientID, "queued", n)
 	} else {
 		a.log.Info("created new event queue", "subscription", clientID)
@@ -387,7 +423,6 @@ func (a *messageQueueApp) onAck(headers map[string]string) {
 	remaining, err := q.Len()
 	a.mu.Unlock()
 	a.metrics.acked(ackLatency)
-	a.metrics.eventDelivered()
 	if err != nil {
 		a.log.Error("queue length check failed", "subscription", clientID, "error", err)
 		a.metrics.queueErrorOccurred("len")
@@ -399,18 +434,60 @@ func (a *messageQueueApp) onAck(headers map[string]string) {
 	}
 }
 
-// onDisconnect records that the client subscribed at headers["destination"]
-// is no longer connected, by any means (client DISCONNECT, network error, or
-// a server-initiated force-close via disconnectWithReason). A destination
-// this app never accepted a subscribe for (e.g. one onSubscribe rejected)
-// is silently ignored, the same as onAck already does for acks it doesn't
-// recognize.
-func (a *messageQueueApp) onDisconnect(headers map[string]string) {
+// onUnsubscribe permanently forgets the client's queue (including any
+// durable on-disk rows via clientQueue.Delete), in-flight delivery/retry
+// timer, and delivery-target bookkeeping for the client that was subscribed
+// at headers["destination"]. This is deliberately more destructive than
+// onDisconnect for that state -- a disconnect only affects connected-clients
+// accounting, since the client may reconnect and resume its queue, but an
+// explicit UNSUBSCRIBE is this client saying it's done with that queue for
+// good.
+//
+// clientIDs' entry for this destination is deliberately NOT deleted here,
+// unlike destinations/queues: it's the only link onDisconnect has back to a
+// clientID once the client has unsubscribed from everything, and
+// connectedClientCount (queuedEventCount's connected-clients counterpart)
+// still needs it later to correctly stop counting this client once the
+// connection eventually closes (internal/stomp's OnDisconnect fires for
+// every destination a connection ever subscribed to, even ones already
+// UNSUBSCRIBEd, precisely so that lookup keeps working). It is finally
+// cleaned up by onDisconnect itself.
+//
+// A destination this app never accepted a subscribe for is silently ignored,
+// the same as onAck/onDisconnect already do.
+func (a *messageQueueApp) onUnsubscribe(headers map[string]string) {
+	destination := headers["destination"]
+
 	a.mu.Lock()
-	_, ok := a.clientIDs[headers["destination"]]
-	a.mu.Unlock()
+	clientID, ok := a.clientIDs[destination]
 	if !ok {
+		a.mu.Unlock()
 		return
 	}
-	a.metrics.sessionEnded()
+	a.clearInFlight(clientID)
+	q := a.queues[clientID]
+	delete(a.queues, clientID)
+	delete(a.destinations, clientID)
+	a.mu.Unlock()
+
+	if q != nil {
+		if err := q.Delete(); err != nil {
+			a.log.Error("queue delete failed", "subscription", clientID, "error", err)
+			a.metrics.queueErrorOccurred("delete")
+		}
+	}
+	a.log.Info("client unsubscribed; queue and bookkeeping deleted", "subscription", clientID, "destination", destination)
+}
+
+// onDisconnect stops counting the client subscribed at headers["destination"]
+// as connected, by any means (client DISCONNECT, network error, or a
+// server-initiated force-close via disconnectWithReason) -- connectedClients
+// itself is computed straight from len(a.clientIDs) at scrape time, so this
+// need only remove the entry. A destination this app never accepted a
+// subscribe for (e.g. one onSubscribe rejected) is a no-op, the same as
+// onAck already does for acks it doesn't recognize.
+func (a *messageQueueApp) onDisconnect(headers map[string]string) {
+	a.mu.Lock()
+	delete(a.clientIDs, headers["destination"])
+	a.mu.Unlock()
 }

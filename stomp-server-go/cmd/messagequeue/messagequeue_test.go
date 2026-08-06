@@ -35,14 +35,15 @@ type sentError struct {
 // OnSubscribe/OnAck/OnDisconnect callbacks directly, and lets a test control
 // what Connected reports, all without any real network I/O.
 type fakeStompServer struct {
-	mu              sync.Mutex
-	onSubscribeFns  []func(map[string]string)
-	onAckFns        []func(map[string]string)
-	onDisconnectFns []func(map[string]string)
-	connected       map[string]bool
-	publishes       []publishCall
-	sentErrors      []sentError
-	disconnects     []string
+	mu               sync.Mutex
+	onSubscribeFns   []func(map[string]string)
+	onUnsubscribeFns []func(map[string]string)
+	onAckFns         []func(map[string]string)
+	onDisconnectFns  []func(map[string]string)
+	connected        map[string]bool
+	publishes        []publishCall
+	sentErrors       []sentError
+	disconnects      []string
 }
 
 func newFakeStompServer() *fakeStompServer {
@@ -60,6 +61,12 @@ func (f *fakeStompServer) OnSubscribe(fn func(headers map[string]string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onSubscribeFns = append(f.onSubscribeFns, fn)
+}
+
+func (f *fakeStompServer) OnUnsubscribe(fn func(headers map[string]string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onUnsubscribeFns = append(f.onUnsubscribeFns, fn)
 }
 
 func (f *fakeStompServer) OnAck(fn func(headers map[string]string)) {
@@ -254,6 +261,158 @@ func TestOnDisconnect_ReconnectAfterDisconnectIncrementsAgain(t *testing.T) {
 	app.onSubscribe(subscribeHeaders("alice"))
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
 		t.Errorf("connectedClients after reconnecting = %v, want 1", got)
+	}
+}
+
+func TestOnUnsubscribe_DeletesQueueAndBookkeeping(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.onEvent("Event 1") // gives the queue something retained to delete
+
+	app.mu.Lock()
+	q := app.queues["alice"]
+	app.mu.Unlock()
+	if q == nil {
+		t.Fatal("queue for alice was never created")
+	}
+
+	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+
+	app.mu.Lock()
+	_, hasQueue := app.queues["alice"]
+	_, hasDestination := app.destinations["alice"]
+	_, hasInFlight := app.inFlights["alice"]
+	app.mu.Unlock()
+	if hasQueue {
+		t.Error("queues[\"alice\"] still present after onUnsubscribe")
+	}
+	if hasDestination {
+		t.Error("destinations[\"alice\"] still present after onUnsubscribe")
+	}
+	if hasInFlight {
+		t.Error("inFlights[\"alice\"] still present after onUnsubscribe")
+	}
+	// clientIDs["alice/testsource"] is deliberately NOT asserted gone here:
+	// it's kept alive on purpose until onDisconnect, so the connected-clients
+	// gauge can still be decremented correctly even after an unsubscribe --
+	// see TestOnDisconnect_DecrementsGaugeEvenAfterPriorUnsubscribe.
+
+	// The queue instance itself must have been told to delete its retained
+	// events too -- not just dropped from the map -- since a durable
+	// (SQLite-backed) queue would otherwise leak that client's rows forever.
+	if n, err := q.Len(); err != nil || n != 0 {
+		t.Errorf("old queue instance Len() after onUnsubscribe = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+func TestOnUnsubscribe_DecrementsActiveQueuesGauge(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+
+	app.onSubscribe(subscribeHeaders("alice"))
+	if got := testutil.ToFloat64(app.metrics.activeQueues); got != 1 {
+		t.Fatalf("activeQueues after subscribe = %v, want 1", got)
+	}
+
+	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+
+	if got := testutil.ToFloat64(app.metrics.activeQueues); got != 0 {
+		t.Errorf("activeQueues after onUnsubscribe = %v, want 0", got)
+	}
+}
+
+func TestOnUnsubscribe_CorrectsQueuedEventsForEventsNeverDelivered(t *testing.T) {
+	app, _ := newTestApp(defaultMessageQueueConfig)
+	// Deliberately offline: onEvent enqueues but never delivers, so the
+	// queue still holds the event when it's deleted below.
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.onEvent("Event 1")
+	app.onEvent("Event 2")
+	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 2 {
+		t.Fatalf("queuedEvents before unsubscribe = %v, want 2", got)
+	}
+
+	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+
+	// Both events are gone without ever being delivered-and-acked; leaving
+	// queuedEvents at 2 would permanently overcount a backlog that no
+	// longer exists.
+	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 0 {
+		t.Errorf("queuedEvents after onUnsubscribe = %v, want 0", got)
+	}
+}
+
+func TestOnUnsubscribe_IgnoresUnknownDestination(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice"))
+
+	app.onUnsubscribe(map[string]string{"destination": "someone/else"})
+
+	app.mu.Lock()
+	_, hasQueue := app.queues["alice"]
+	app.mu.Unlock()
+	if !hasQueue {
+		t.Error("queues[\"alice\"] was deleted by an unrelated onUnsubscribe")
+	}
+	if got := testutil.ToFloat64(app.metrics.activeQueues); got != 1 {
+		t.Errorf("activeQueues after an unrelated onUnsubscribe = %v, want still 1 (unaffected)", got)
+	}
+}
+
+func TestOnUnsubscribe_DoesNotAffectConnectedClientsGauge(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice"))
+
+	// Unsubscribing is not the same as disconnecting: the connection (and
+	// this app's per-connection accounting) may still be live even though
+	// the client no longer wants this particular queue.
+	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
+		t.Errorf("connectedClients after onUnsubscribe = %v, want still 1 (unaffected)", got)
+	}
+}
+
+func TestOnDisconnect_DecrementsGaugeEvenAfterPriorUnsubscribe(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice"))
+
+	// A client that unsubscribes from its only destination before the
+	// connection itself ends must still have connected-clients decremented
+	// once that connection finally closes -- internal/stomp's OnDisconnect
+	// is expected to still report this destination even though it's no
+	// longer live, precisely so this lookup keeps working.
+	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
+		t.Fatalf("connectedClients after onUnsubscribe = %v, want still 1", got)
+	}
+
+	app.onDisconnect(map[string]string{"destination": "alice/testsource"})
+
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
+		t.Errorf("connectedClients after onDisconnect (following an earlier onUnsubscribe) = %v, want 0", got)
+	}
+}
+
+func TestOnUnsubscribe_ThenResubscribeStartsWithAFreshEmptyQueue(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.onEvent("Event 1")
+	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.mu.Lock()
+	q := app.queues["alice"]
+	app.mu.Unlock()
+	if n, err := q.Len(); err != nil || n != 0 {
+		t.Errorf("Len() on the queue built after resubscribing = (%d, %v), want (0, nil) -- old events must not resurface", n, err)
 	}
 }
 

@@ -434,6 +434,245 @@ func TestIntegration_OnDisconnectFiresOncePerDestinationDespiteDuplicateSubscrip
 	}
 }
 
+func TestIntegration_OnUnsubscribeFiresWithExpectedHeaders(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	unsubscribed := make(chan map[string]string, 1)
+	srv.OnUnsubscribe(func(headers map[string]string) { unsubscribed <- headers })
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := sub.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+
+	select {
+	case headers := <-unsubscribed:
+		if headers["destination"] != "/topic/test" {
+			t.Errorf("destination = %q, want %q", headers["destination"], "/topic/test")
+		}
+		if headers["id"] == "" {
+			t.Error("id header is empty, want the SUBSCRIBE's id")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for OnUnsubscribe callback")
+	}
+
+	waitDisconnected(t, srv, "/topic/test")
+}
+
+func TestIntegration_UnsubscribeStopsFurtherDelivery(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	leaving := dialStompClient(t, wsURL, nil)
+	staying := dialStompClient(t, wsURL, nil)
+
+	subLeaving, err := leaving.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe (leaving): %v", err)
+	}
+	subStaying, err := staying.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe (staying): %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := subLeaving.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+
+	// go-stomp closes a Subscription's channel once its own Unsubscribe
+	// completes; draining that here just consumes the closed-channel signal,
+	// not proof of a real delivery -- ok will be false.
+	select {
+	case _, ok := <-subLeaving.C:
+		if ok {
+			t.Fatal("subLeaving.C delivered a real message after Unsubscribe")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for subLeaving.C to close")
+	}
+
+	const body = `{"n":1}`
+	if err := staying.Send("/topic/test", "application/json", []byte(body)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	msg := recvMessage(t, subStaying)
+	if string(msg.Body) != body {
+		t.Errorf("Body = %q, want %q", msg.Body, body)
+	}
+}
+
+func TestIntegration_UnsubscribeUnknownIDIsProtocolError(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+
+	// Dialed and driven raw (bypassing the go-stomp client), since it always
+	// tracks and reuses real subscription ids -- there's no way to ask it to
+	// send an UNSUBSCRIBE for one that never existed.
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	t.Cleanup(func() { ws.Close() })
+	conn := newWSConn(ws)
+
+	unsubscribed := make(chan map[string]string, 1)
+	srv.OnUnsubscribe(func(headers map[string]string) { unsubscribed <- headers })
+
+	if _, err := conn.Write(NewFrame("CONNECT", map[string]string{"accept-version": "1.2", "host": "test"}, "").Encode()); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	connected, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("read CONNECTED: %v", err)
+	}
+	if connected.Command != "CONNECTED" {
+		t.Fatalf("command = %q, want CONNECTED", connected.Command)
+	}
+
+	if _, err := conn.Write(NewFrame("UNSUBSCRIBE", map[string]string{"id": "no-such-subscription"}, "").Encode()); err != nil {
+		t.Fatalf("write UNSUBSCRIBE: %v", err)
+	}
+	reply, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply.Command != "ERROR" {
+		t.Errorf("command = %q, want ERROR", reply.Command)
+	}
+
+	select {
+	case headers := <-unsubscribed:
+		t.Fatalf("OnUnsubscribe fired for an unknown id: %v", headers)
+	case <-time.After(300 * time.Millisecond):
+		// expected: no callback
+	}
+}
+
+func TestIntegration_UnsubscribeOnlyDropsDestinationOnceAllDuplicatesGone(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	sub1, err := conn.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	sub2, err := conn.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("second Subscribe: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := sub1.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if !srv.Connected("/topic/test") {
+		t.Fatal("Connected(\"/topic/test\") = false after only one of two duplicate subscriptions was removed")
+	}
+
+	if err := sub2.Unsubscribe(); err != nil {
+		t.Fatalf("second Unsubscribe: %v", err)
+	}
+	waitDisconnected(t, srv, "/topic/test")
+}
+
+func TestIntegration_UnsubscribeThenLateAckOnStaleIDDoesNotPanicServer(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckClientIndividual)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	// A second, still-live subscription on the same connection, purely so
+	// there's a channel left to observe the server's ERROR reply on --
+	// go-stomp's client fans an ERROR frame out to every subscription
+	// channel it still has open, then closes the whole connection.
+	other, err := conn.Subscribe("/topic/other", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe /topic/other: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := conn.Send("/topic/test", "application/json", []byte(`{"n":1}`)); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	msg := recvMessage(t, sub) // delivered but deliberately left unacked
+
+	if err := sub.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	waitDisconnected(t, srv, "/topic/test")
+
+	// A late Ack on a message whose subscription no longer exists must not
+	// panic the server (a nil *subscription dereference on the now-deleted
+	// subscription would take the whole connection's goroutine down) -- it
+	// should be treated like any other unrecognized ack id: an ERROR reply,
+	// not a crash.
+	if err := conn.Ack(msg); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+
+	select {
+	case errMsg := <-other.C:
+		if errMsg.Err == nil {
+			t.Fatalf("expected an ERROR message, got: %+v", errMsg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the server's ERROR reply")
+	}
+
+	// The server process itself must still be healthy: a brand new
+	// connection should work normally.
+	fresh := dialStompClient(t, wsURL, nil)
+	if _, err := fresh.Subscribe("/topic/fresh", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe on a fresh connection after the panic-risk path: %v", err)
+	}
+}
+
+func TestIntegration_OnDisconnectFiresForDestinationEvenAfterExplicitUnsubscribe(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	disconnected := make(chan map[string]string, 1)
+	srv.OnDisconnect(func(headers map[string]string) { disconnected <- headers })
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := sub.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	waitDisconnected(t, srv, "/topic/test")
+
+	// The connection has zero live subscriptions now, but it once had one --
+	// OnDisconnect must still report it when the connection itself ends,
+	// so a caller tracking "is this client's session still around" (like
+	// messagequeue's connected-clients gauge) isn't left permanently stuck
+	// believing a since-unsubscribed-then-disconnected client is still here.
+	if err := conn.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	select {
+	case headers := <-disconnected:
+		if headers["destination"] != "/topic/test" {
+			t.Errorf("destination = %q, want %q", headers["destination"], "/topic/test")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for OnDisconnect after unsubscribe-then-disconnect")
+	}
+}
+
 func TestIntegration_SendErrorDeliversErrorFrameToSubscribedConnection(t *testing.T) {
 	wsURL, srv := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)

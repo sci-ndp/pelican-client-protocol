@@ -48,13 +48,22 @@ type session struct {
 	writeMu       sync.Mutex // serializes writes to conn (gorilla/websocket allows only one concurrent writer)
 	subscriptions map[string]*subscription
 	ackIndex      map[string]string // ack id -> subscription id
+
+	// everSubscribed accumulates every destination this connection has ever
+	// held a live subscription to, and -- unlike subscriptions -- is never
+	// shrunk by UNSUBSCRIBE. It exists purely so OnDisconnect can still
+	// report a destination the client explicitly unsubscribed from earlier
+	// in the connection's life: subscriptions alone would have already lost
+	// that destination by the time the connection actually closes.
+	everSubscribed map[string]bool
 }
 
 func newSession(conn net.Conn) *session {
 	return &session{
-		conn:          conn,
-		subscriptions: map[string]*subscription{},
-		ackIndex:      map[string]string{},
+		conn:           conn,
+		subscriptions:  map[string]*subscription{},
+		ackIndex:       map[string]string{},
+		everSubscribed: map[string]bool{},
 	}
 }
 
@@ -78,6 +87,7 @@ type Server struct {
 	subscriptions map[string]map[net.Conn]bool // destination -> set of subscribed conns
 	log           *slog.Logger
 	onSubscribe   []func(headers map[string]string)
+	onUnsubscribe []func(headers map[string]string)
 	onAck         []func(headers map[string]string)
 	onDisconnect  []func(headers map[string]string)
 }
@@ -108,6 +118,18 @@ type StompServer interface {
 	// it must not block or call back into the server while holding a lock.
 	OnSubscribe(fn func(headers map[string]string))
 
+	// OnUnsubscribe registers fn to be called after every successful
+	// UNSUBSCRIBE, i.e. one the given id actually matched a live subscription
+	// on that connection. fn receives a headers map with "destination" set to
+	// that subscription's destination and "id" set to the UNSUBSCRIBE's id
+	// header. Unlike OnDisconnect, this fires only for an explicit UNSUBSCRIBE
+	// while the connection otherwise stays open; a connection closing (with
+	// or without prior UNSUBSCRIBEs) is OnDisconnect's concern, not this
+	// one's. fn runs synchronously on the unsubscribing client's connection
+	// goroutine, so (like OnSubscribe/OnAck) it must not block or call back
+	// into the server while holding a lock.
+	OnUnsubscribe(fn func(headers map[string]string))
+
 	// OnAck registers fn to be called once for every pending message this
 	// server resolves via a client's ACK. A single cumulative ack:client ACK
 	// can resolve more than one message; fn is called once per message
@@ -119,15 +141,16 @@ type StompServer interface {
 	// while holding a lock.
 	OnAck(fn func(headers map[string]string))
 
-	// OnDisconnect registers fn to be called once for every subscription an
-	// ending connection had, right as its session is torn down -- whether
-	// that end was a client-sent DISCONNECT, a network error, or the
-	// connection being closed via Disconnect/SendError+Disconnect. fn
-	// receives a headers map with "destination" set to that subscription's
-	// destination. A connection with no subscriptions produces no calls. fn
-	// runs synchronously on that connection's own goroutine, so (like
-	// OnSubscribe/OnAck) it must not block or call back into the server
-	// while holding a lock.
+	// OnDisconnect registers fn to be called once for every destination the
+	// ending connection ever held a live subscription to -- including one it
+	// already UNSUBSCRIBEd from earlier in its life, not just what's still
+	// subscribed at close -- right as its session is torn down. That end may
+	// be a client-sent DISCONNECT, a network error, or the connection being
+	// closed via Disconnect/SendError+Disconnect. fn receives a headers map
+	// with "destination" set to that destination. A connection that never
+	// subscribed to anything produces no calls. fn runs synchronously on
+	// that connection's own goroutine, so (like OnSubscribe/OnAck) it must
+	// not block or call back into the server while holding a lock.
 	OnDisconnect(fn func(headers map[string]string))
 
 	// SendError sends an ERROR frame carrying message to every session
@@ -151,6 +174,13 @@ var _ StompServer = (*Server)(nil)
 func (s *Server) OnSubscribe(fn func(headers map[string]string)) {
 	s.mu.Lock()
 	s.onSubscribe = append(s.onSubscribe, fn)
+	s.mu.Unlock()
+}
+
+// OnUnsubscribe implements StompServer.
+func (s *Server) OnUnsubscribe(fn func(headers map[string]string)) {
+	s.mu.Lock()
+	s.onUnsubscribe = append(s.onUnsubscribe, fn)
 	s.mu.Unlock()
 }
 
@@ -243,8 +273,6 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	defer func() {
 		s.mu.Lock()
-		seen := map[string]bool{}
-		var destinations []string
 		for _, sub := range sess.subscriptions {
 			if conns, ok := s.subscriptions[sub.destination]; ok {
 				delete(conns, conn)
@@ -252,12 +280,12 @@ func (s *Server) handleConn(conn net.Conn) {
 					delete(s.subscriptions, sub.destination)
 				}
 			}
-			if !seen[sub.destination] {
-				seen[sub.destination] = true
-				destinations = append(destinations, sub.destination)
-			}
 		}
 		delete(s.sessions, conn)
+		destinations := make([]string, 0, len(sess.everSubscribed))
+		for d := range sess.everSubscribed {
+			destinations = append(destinations, d)
+		}
 		callbacks := append([]func(map[string]string){}, s.onDisconnect...)
 		s.mu.Unlock()
 
@@ -349,6 +377,8 @@ func (s *Server) dispatch(sess *session, frame *Frame) error {
 		return s.handleConnect(sess, frame)
 	case "SUBSCRIBE":
 		return s.handleSubscribe(sess, frame)
+	case "UNSUBSCRIBE":
+		return s.handleUnsubscribe(sess, frame)
 	case "ACK":
 		return s.handleAck(sess, frame)
 	case "NACK":
@@ -386,6 +416,7 @@ func (s *Server) handleSubscribe(sess *session, frame *Frame) error {
 
 	s.mu.Lock()
 	sess.subscriptions[subID] = &subscription{destination: destination, ack: ackMode, pending: map[string]*pendingMessage{}}
+	sess.everSubscribed[destination] = true
 	if s.subscriptions[destination] == nil {
 		s.subscriptions[destination] = map[net.Conn]bool{}
 	}
@@ -395,6 +426,61 @@ func (s *Server) handleSubscribe(sess *session, frame *Frame) error {
 
 	for _, cb := range callbacks {
 		cb(frame.Headers)
+	}
+
+	if receipt := frame.Headers["receipt"]; receipt != "" {
+		return s.send(sess, NewFrame("RECEIPT", map[string]string{"receipt-id": receipt}, ""))
+	}
+	return nil
+}
+
+// handleUnsubscribe removes one subscription from sess, cleaning up both the
+// server-wide destination index and any of that subscription's pending
+// (unacked) messages from sess.ackIndex -- left behind, a stale ackIndex
+// entry would make a later ACK/NACK on it look up a subscription that no
+// longer exists and panic on the nil *subscription.
+func (s *Server) handleUnsubscribe(sess *session, frame *Frame) error {
+	subID := frame.Headers["id"]
+	if subID == "" {
+		return protocolErrorf("UNSUBSCRIBE requires id")
+	}
+
+	s.mu.Lock()
+	sub, ok := sess.subscriptions[subID]
+	if !ok {
+		s.mu.Unlock()
+		return protocolErrorf("unknown subscription id: %s", subID)
+	}
+	destination := sub.destination
+	delete(sess.subscriptions, subID)
+	for ackID := range sub.pending {
+		delete(sess.ackIndex, ackID)
+	}
+
+	// A connection can hold more than one subscription to the same
+	// destination (different ids); only drop the destination-level entry
+	// once none of them remain.
+	stillSubscribed := false
+	for _, other := range sess.subscriptions {
+		if other.destination == destination {
+			stillSubscribed = true
+			break
+		}
+	}
+	if !stillSubscribed {
+		if conns, ok := s.subscriptions[destination]; ok {
+			delete(conns, sess.conn)
+			if len(conns) == 0 {
+				delete(s.subscriptions, destination)
+			}
+		}
+	}
+	callbacks := append([]func(map[string]string){}, s.onUnsubscribe...)
+	s.mu.Unlock()
+
+	headers := map[string]string{"destination": destination, "id": subID}
+	for _, cb := range callbacks {
+		cb(headers)
 	}
 
 	if receipt := frame.Headers["receipt"]; receipt != "" {

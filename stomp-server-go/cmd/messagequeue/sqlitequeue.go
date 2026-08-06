@@ -116,3 +116,10 @@ func (q *sqliteClientQueue) Len() (int, error) {
 	}
 	return n, nil
 }
+
+func (q *sqliteClientQueue) Delete() error {
+	if _, err := q.db.Exec(`DELETE FROM queue_events WHERE client_id = ?`, q.clientID); err != nil {
+		return fmt.Errorf("delete: %w", err)
+	}
+	return nil
+}

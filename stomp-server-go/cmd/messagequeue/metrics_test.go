@@ -14,8 +14,8 @@ import (
 func TestMetrics_SubscribeAcceptedAndRejected(t *testing.T) {
 	app, srv := newTestApp(defaultMessageQueueConfig)
 
-	app.onSubscribe(subscribeHeaders("alice")) // accepted
-	app.onSubscribe(map[string]string{"subscription": "", "destination": "", "ack": "client-individual"})            // missing headers
+	app.onSubscribe(subscribeHeaders("alice"))                                                                        // accepted
+	app.onSubscribe(map[string]string{"subscription": "", "destination": "", "ack": "client-individual"})             // missing headers
 	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "bob/foo", "ack": "client-individual"}) // wrong owner
 
 	if got := testutil.ToFloat64(app.metrics.subscriptions.WithLabelValues("accepted")); got != 1 {
@@ -166,6 +166,7 @@ func (brokenClientQueue) Enqueue(string, int) (bool, error) { return false, erro
 func (brokenClientQueue) PeekFront() (string, bool, error)  { return "", false, errors.New("boom") }
 func (brokenClientQueue) PopFront() error                   { return errors.New("boom") }
 func (brokenClientQueue) Len() (int, error)                 { return 0, errors.New("boom") }
+func (brokenClientQueue) Delete() error                     { return errors.New("boom") }
 
 func TestMetrics_QueueErrorsRecordedByOperation(t *testing.T) {
 	app, srv := newTestApp(defaultMessageQueueConfig)

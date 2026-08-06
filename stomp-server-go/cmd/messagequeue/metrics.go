@@ -9,12 +9,30 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// liveQueueState is the read-only view into messageQueueApp's own
+// authoritative state that appMetrics needs so connectedClients,
+// activeQueues, and queuedEvents can be computed directly at scrape time
+// (via GaugeFunc) instead of kept in sync by hand at every call site that
+// touches queues/clientIDs. That hand-maintained approach is exactly what
+// produced this package's past gauge-drift bugs (queued_events oscillating
+// negative across restarts, then again after UNSUBSCRIBE deleted a queue
+// without correcting it) -- computing from the source of truth on every
+// scrape makes that whole class of bug structurally impossible. messageQueueApp
+// implements this interface; see its activeQueueCount/connectedClientCount/
+// queuedEventCount methods.
+type liveQueueState interface {
+	activeQueueCount() int
+	connectedClientCount() int
+	queuedEventCount() int
+}
+
 // appMetrics is the messagequeue app's Prometheus instrumentation. This file
 // is the only place in the package that imports the prometheus client
 // library: messageQueueApp's own logic just calls these small,
 // semantically-named methods where something happens (a client subscribed,
 // an event was enqueued, ...) without knowing or caring that Prometheus is
-// what's counting it.
+// what's counting it -- except for the three GaugeFuncs above, which instead
+// read messageQueueApp's own state directly through liveQueueState.
 //
 // Each appMetrics owns its own registry rather than registering into the
 // global default one, so constructing more than one in the same process --
@@ -23,9 +41,9 @@ type appMetrics struct {
 	registry *prometheus.Registry
 
 	subscriptions     *prometheus.CounterVec
-	connectedClients  prometheus.Gauge
-	activeQueues      prometheus.Gauge
-	queuedEvents      prometheus.Gauge
+	connectedClients  prometheus.GaugeFunc
+	activeQueues      prometheus.GaugeFunc
+	queuedEvents      prometheus.GaugeFunc
 	eventsEnqueued    prometheus.Counter
 	eventsDropped     prometheus.Counter
 	queueOverflows    *prometheus.CounterVec
@@ -37,25 +55,25 @@ type appMetrics struct {
 	queueErrors       *prometheus.CounterVec
 }
 
-func newAppMetrics() *appMetrics {
+func newAppMetrics(state liveQueueState) *appMetrics {
 	m := &appMetrics{
 		registry: prometheus.NewRegistry(),
 		subscriptions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "messagequeue_subscriptions_total",
 			Help: "SUBSCRIBE frames handled, by outcome (accepted, or the reason it was rejected).",
 		}, []string{"outcome"}),
-		connectedClients: prometheus.NewGauge(prometheus.GaugeOpts{
+		connectedClients: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "messagequeue_connected_clients",
 			Help: "Number of clients with a currently-open connection.",
-		}),
-		activeQueues: prometheus.NewGauge(prometheus.GaugeOpts{
+		}, func() float64 { return float64(state.connectedClientCount()) }),
+		activeQueues: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "messagequeue_active_queues",
 			Help: "Number of client queues currently tracked by this process.",
-		}),
-		queuedEvents: prometheus.NewGauge(prometheus.GaugeOpts{
+		}, func() float64 { return float64(state.activeQueueCount()) }),
+		queuedEvents: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "messagequeue_queued_events",
 			Help: "Total events currently pending delivery across all client queues.",
-		}),
+		}, func() float64 { return float64(state.queuedEventCount()) }),
 		eventsEnqueued: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "messagequeue_events_enqueued_total",
 			Help: "Events successfully appended to a client queue (once per client per fanned-out event).",
@@ -125,44 +143,12 @@ func (m *appMetrics) subscribeRejected(reason string) {
 	m.subscriptions.WithLabelValues(reason).Inc()
 }
 
-// sessionStarted records a client successfully subscribing -- i.e. a
-// currently-open connection this app now considers active.
-func (m *appMetrics) sessionStarted() { m.connectedClients.Inc() }
-
-// sessionEnded records that connection ending, by any means (client
-// DISCONNECT, network error, or a server-initiated force-close).
-func (m *appMetrics) sessionEnded() { m.connectedClients.Dec() }
-
-func (m *appMetrics) queueCreated() { m.activeQueues.Inc() }
-
-// queueResumed seeds queuedEvents with n events a durable queue already had
-// on disk before this process ever built an in-process handle for that
-// client. Without this, a backlog resumed from a prior process run is
-// invisible to the gauge until it's delivered -- at which point the
-// resulting eventDelivered() decrement has no matching eventEnqueued()
-// increment (from *this* process) to balance against, driving the gauge
-// negative.
-func (m *appMetrics) queueResumed(n int) {
-	m.queuedEvents.Add(float64(n))
-}
-
 // eventEnqueued records one event successfully appended to a client queue.
-func (m *appMetrics) eventEnqueued() {
-	m.eventsEnqueued.Inc()
-	m.queuedEvents.Inc()
-}
+func (m *appMetrics) eventEnqueued() { m.eventsEnqueued.Inc() }
 
 // eventDropped records an event that never reached any queue because none
 // existed yet.
 func (m *appMetrics) eventDropped() { m.eventsDropped.Inc() }
-
-// eventTrimmed records one event dropped from the front of a queue to
-// enforce its cap.
-func (m *appMetrics) eventTrimmed() { m.queuedEvents.Dec() }
-
-// eventDelivered records one event removed from the front of a queue
-// because it was acked.
-func (m *appMetrics) eventDelivered() { m.queuedEvents.Dec() }
 
 func (m *appMetrics) queueOverflowed(clientConnected bool) {
 	m.queueOverflows.WithLabelValues(strconv.FormatBool(clientConnected)).Inc()
