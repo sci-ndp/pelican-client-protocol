@@ -32,16 +32,17 @@ type sentError struct {
 
 // fakeStompServer is a stomp.StompServer test double: it records Publish,
 // SendError, and Disconnect calls, lets a test drive the app's
-// OnSubscribe/OnAck callbacks directly, and lets a test control what
-// Connected reports, all without any real network I/O.
+// OnSubscribe/OnAck/OnDisconnect callbacks directly, and lets a test control
+// what Connected reports, all without any real network I/O.
 type fakeStompServer struct {
-	mu             sync.Mutex
-	onSubscribeFns []func(map[string]string)
-	onAckFns       []func(map[string]string)
-	connected      map[string]bool
-	publishes      []publishCall
-	sentErrors     []sentError
-	disconnects    []string
+	mu              sync.Mutex
+	onSubscribeFns  []func(map[string]string)
+	onAckFns        []func(map[string]string)
+	onDisconnectFns []func(map[string]string)
+	connected       map[string]bool
+	publishes       []publishCall
+	sentErrors      []sentError
+	disconnects     []string
 }
 
 func newFakeStompServer() *fakeStompServer {
@@ -65,6 +66,12 @@ func (f *fakeStompServer) OnAck(fn func(headers map[string]string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onAckFns = append(f.onAckFns, fn)
+}
+
+func (f *fakeStompServer) OnDisconnect(fn func(headers map[string]string)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onDisconnectFns = append(f.onDisconnectFns, fn)
 }
 
 func (f *fakeStompServer) SendError(destination string, message string) error {
@@ -182,6 +189,71 @@ func TestOnSubscribe_CreatesQueueAndDeliversOnceConnected(t *testing.T) {
 	}
 	if publishes[0].messageID == "" {
 		t.Error("messageID is empty, want a generated id")
+	}
+}
+
+func TestOnSubscribe_IncrementsConnectedClientsGauge(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	srv.setConnected("bob/testsource", true)
+
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
+		t.Fatalf("connectedClients before any subscribe = %v, want 0", got)
+	}
+
+	app.onSubscribe(subscribeHeaders("alice"))
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
+		t.Errorf("connectedClients after one subscribe = %v, want 1", got)
+	}
+
+	app.onSubscribe(subscribeHeaders("bob"))
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 2 {
+		t.Errorf("connectedClients after a second client subscribes = %v, want 2", got)
+	}
+}
+
+func TestOnDisconnect_DecrementsConnectedClientsGauge(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice"))
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
+		t.Fatalf("connectedClients after subscribe = %v, want 1", got)
+	}
+
+	app.onDisconnect(map[string]string{"destination": "alice/testsource"})
+
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
+		t.Errorf("connectedClients after onDisconnect = %v, want 0", got)
+	}
+}
+
+func TestOnDisconnect_IgnoresUnknownDestination(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice"))
+
+	app.onDisconnect(map[string]string{"destination": "someone/else"})
+
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
+		t.Errorf("connectedClients after an unrelated onDisconnect = %v, want still 1 (unaffected)", got)
+	}
+}
+
+func TestOnDisconnect_ReconnectAfterDisconnectIncrementsAgain(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.onDisconnect(map[string]string{"destination": "alice/testsource"})
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
+		t.Fatalf("connectedClients after disconnect = %v, want 0", got)
+	}
+
+	// A genuine reconnect (new WebSocket, same subscription header) should
+	// bring the gauge back up, not leave it stuck at 0.
+	app.onSubscribe(subscribeHeaders("alice"))
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
+		t.Errorf("connectedClients after reconnecting = %v, want 1", got)
 	}
 }
 

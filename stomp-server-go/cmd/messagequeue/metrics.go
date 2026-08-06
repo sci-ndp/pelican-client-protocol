@@ -23,6 +23,7 @@ type appMetrics struct {
 	registry *prometheus.Registry
 
 	subscriptions     *prometheus.CounterVec
+	connectedClients  prometheus.Gauge
 	activeQueues      prometheus.Gauge
 	queuedEvents      prometheus.Gauge
 	eventsEnqueued    prometheus.Counter
@@ -43,6 +44,10 @@ func newAppMetrics() *appMetrics {
 			Name: "messagequeue_subscriptions_total",
 			Help: "SUBSCRIBE frames handled, by outcome (accepted, or the reason it was rejected).",
 		}, []string{"outcome"}),
+		connectedClients: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "messagequeue_connected_clients",
+			Help: "Number of clients with a currently-open connection.",
+		}),
 		activeQueues: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "messagequeue_active_queues",
 			Help: "Number of client queues currently tracked by this process.",
@@ -92,6 +97,7 @@ func newAppMetrics() *appMetrics {
 
 	m.registry.MustRegister(
 		m.subscriptions,
+		m.connectedClients,
 		m.activeQueues,
 		m.queuedEvents,
 		m.eventsEnqueued,
@@ -118,6 +124,14 @@ func (m *appMetrics) subscribeAccepted() { m.subscriptions.WithLabelValues("acce
 func (m *appMetrics) subscribeRejected(reason string) {
 	m.subscriptions.WithLabelValues(reason).Inc()
 }
+
+// sessionStarted records a client successfully subscribing -- i.e. a
+// currently-open connection this app now considers active.
+func (m *appMetrics) sessionStarted() { m.connectedClients.Inc() }
+
+// sessionEnded records that connection ending, by any means (client
+// DISCONNECT, network error, or a server-initiated force-close).
+func (m *appMetrics) sessionEnded() { m.connectedClients.Dec() }
 
 func (m *appMetrics) queueCreated() { m.activeQueues.Inc() }
 

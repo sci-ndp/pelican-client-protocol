@@ -79,6 +79,7 @@ type Server struct {
 	log           *slog.Logger
 	onSubscribe   []func(headers map[string]string)
 	onAck         []func(headers map[string]string)
+	onDisconnect  []func(headers map[string]string)
 }
 
 func NewServer(log *slog.Logger) *Server {
@@ -118,6 +119,17 @@ type StompServer interface {
 	// while holding a lock.
 	OnAck(fn func(headers map[string]string))
 
+	// OnDisconnect registers fn to be called once for every subscription an
+	// ending connection had, right as its session is torn down -- whether
+	// that end was a client-sent DISCONNECT, a network error, or the
+	// connection being closed via Disconnect/SendError+Disconnect. fn
+	// receives a headers map with "destination" set to that subscription's
+	// destination. A connection with no subscriptions produces no calls. fn
+	// runs synchronously on that connection's own goroutine, so (like
+	// OnSubscribe/OnAck) it must not block or call back into the server
+	// while holding a lock.
+	OnDisconnect(fn func(headers map[string]string))
+
 	// SendError sends an ERROR frame carrying message to every session
 	// currently subscribed to destination, without closing the connection.
 	// It is a no-op if none is. Typically paired with a following Disconnect
@@ -146,6 +158,13 @@ func (s *Server) OnSubscribe(fn func(headers map[string]string)) {
 func (s *Server) OnAck(fn func(headers map[string]string)) {
 	s.mu.Lock()
 	s.onAck = append(s.onAck, fn)
+	s.mu.Unlock()
+}
+
+// OnDisconnect implements StompServer.
+func (s *Server) OnDisconnect(fn func(headers map[string]string)) {
+	s.mu.Lock()
+	s.onDisconnect = append(s.onDisconnect, fn)
 	s.mu.Unlock()
 }
 
@@ -224,6 +243,8 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	defer func() {
 		s.mu.Lock()
+		seen := map[string]bool{}
+		var destinations []string
 		for _, sub := range sess.subscriptions {
 			if conns, ok := s.subscriptions[sub.destination]; ok {
 				delete(conns, conn)
@@ -231,9 +252,22 @@ func (s *Server) handleConn(conn net.Conn) {
 					delete(s.subscriptions, sub.destination)
 				}
 			}
+			if !seen[sub.destination] {
+				seen[sub.destination] = true
+				destinations = append(destinations, sub.destination)
+			}
 		}
 		delete(s.sessions, conn)
+		callbacks := append([]func(map[string]string){}, s.onDisconnect...)
 		s.mu.Unlock()
+
+		for _, d := range destinations {
+			headers := map[string]string{"destination": d}
+			for _, cb := range callbacks {
+				cb(headers)
+			}
+		}
+
 		conn.Close()
 	}()
 

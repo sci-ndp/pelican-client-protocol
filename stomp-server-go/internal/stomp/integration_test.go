@@ -293,6 +293,147 @@ func TestIntegration_OnAckFiresOncePerMessageOnCumulativeAck(t *testing.T) {
 	}
 }
 
+// waitConnected polls until srv reports destination as connected, or fails
+// the test -- SUBSCRIBE is processed asynchronously on the server's
+// connection goroutine, so Connected may not reflect it the instant a
+// client's Subscribe call returns.
+func waitConnected(t *testing.T, srv *Server, destination string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !srv.Connected(destination) {
+		if time.Now().After(deadline) {
+			t.Fatalf("Connected(%q) stayed false after subscribing", destination)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// waitDisconnected polls until srv reports destination as no longer
+// connected, or fails the test -- disconnect cleanup runs asynchronously off
+// the read-error path, not synchronously with whatever triggered it.
+func waitDisconnected(t *testing.T, srv *Server, destination string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.Connected(destination) {
+		if time.Now().After(deadline) {
+			t.Fatalf("Connected(%q) stayed true", destination)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestIntegration_OnDisconnectFiresOnClientInitiatedDisconnect(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	disconnected := make(chan map[string]string, 1)
+	srv.OnDisconnect(func(headers map[string]string) { disconnected <- headers })
+
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := conn.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	select {
+	case headers := <-disconnected:
+		if headers["destination"] != "/topic/test" {
+			t.Errorf("destination = %q, want %q", headers["destination"], "/topic/test")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for OnDisconnect callback")
+	}
+}
+
+func TestIntegration_OnDisconnectFiresOnAbruptClose(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	conn, err := stomp.Connect(newWSConn(ws), stomp.ConnOpt.HeartBeat(0, 0), stomp.ConnOpt.Logger(discardStompLogger{}))
+	if err != nil {
+		t.Fatalf("stomp connect: %v", err)
+	}
+
+	disconnected := make(chan map[string]string, 1)
+	srv.OnDisconnect(func(headers map[string]string) { disconnected <- headers })
+
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := ws.Close(); err != nil { // abrupt: no STOMP DISCONNECT sent at all
+		t.Fatalf("ws.Close: %v", err)
+	}
+
+	select {
+	case headers := <-disconnected:
+		if headers["destination"] != "/topic/test" {
+			t.Errorf("destination = %q, want %q", headers["destination"], "/topic/test")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for OnDisconnect callback after an abrupt close")
+	}
+}
+
+func TestIntegration_OnDisconnectDoesNotFireForConnectionWithNoSubscriptions(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	called := make(chan map[string]string, 1)
+	srv.OnDisconnect(func(headers map[string]string) { called <- headers })
+
+	if err := conn.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+
+	select {
+	case headers := <-called:
+		t.Fatalf("OnDisconnect fired for a connection with no subscriptions: %v", headers)
+	case <-time.After(300 * time.Millisecond):
+		// expected: no callback
+	}
+}
+
+func TestIntegration_OnDisconnectFiresOncePerDestinationDespiteDuplicateSubscriptions(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	conn := dialStompClient(t, wsURL, nil)
+
+	var mu sync.Mutex
+	var calls []string
+	srv.OnDisconnect(func(headers map[string]string) {
+		mu.Lock()
+		calls = append(calls, headers["destination"])
+		mu.Unlock()
+	})
+
+	// Two subscriptions to the SAME destination, different ids, same connection.
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("second Subscribe: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	if err := conn.Disconnect(); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != "/topic/test" {
+		t.Errorf("OnDisconnect calls = %v, want exactly one for /topic/test", calls)
+	}
+}
+
 func TestIntegration_SendErrorDeliversErrorFrameToSubscribedConnection(t *testing.T) {
 	wsURL, srv := startTestServer(t, NoAuth{})
 	conn := dialStompClient(t, wsURL, nil)
@@ -301,16 +442,7 @@ func TestIntegration_SendErrorDeliversErrorFrameToSubscribedConnection(t *testin
 	if err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-
-	// SUBSCRIBE is processed asynchronously on the server's connection
-	// goroutine, so Connected may not reflect it the instant Subscribe returns.
-	deadline := time.Now().Add(2 * time.Second)
-	for !srv.Connected("/topic/test") {
-		if time.Now().After(deadline) {
-			t.Fatal("Connected(\"/topic/test\") stayed false after subscribing")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitConnected(t, srv, "/topic/test")
 
 	if err := srv.SendError("/topic/test", "misbehaving client"); err != nil {
 		t.Fatalf("SendError: %v", err)
@@ -347,15 +479,7 @@ func TestIntegration_DisconnectClosesSubscribedConnection(t *testing.T) {
 	if err := srv.Disconnect("/topic/test"); err != nil {
 		t.Fatalf("Disconnect: %v", err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !srv.Connected("/topic/test") {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Error("Connected(\"/topic/test\") stayed true after Disconnect")
+	waitDisconnected(t, srv, "/topic/test")
 }
 
 func TestIntegration_DisconnectNoOpWhenNobodySubscribed(t *testing.T) {
@@ -376,27 +500,10 @@ func TestIntegration_ConnectedReflectsSubscriptionState(t *testing.T) {
 	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
-
-	// SUBSCRIBE is processed asynchronously on the server's connection
-	// goroutine, so Connected may not reflect it the instant Subscribe returns.
-	deadline := time.Now().Add(2 * time.Second)
-	for !srv.Connected("/topic/test") {
-		if time.Now().After(deadline) {
-			t.Fatal("Connected(\"/topic/test\") stayed false after subscribing")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitConnected(t, srv, "/topic/test")
 
 	if err := conn.Disconnect(); err != nil {
 		t.Fatalf("Disconnect: %v", err)
 	}
-
-	disconnectDeadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(disconnectDeadline) {
-		if !srv.Connected("/topic/test") {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Error("Connected(\"/topic/test\") stayed true after the client disconnected")
+	waitDisconnected(t, srv, "/topic/test")
 }

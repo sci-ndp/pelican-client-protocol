@@ -98,6 +98,7 @@ func newMessageQueueAppWithConfig(srv stomp.StompServer, log *slog.Logger, sourc
 	}
 	srv.OnSubscribe(a.onSubscribe)
 	srv.OnAck(a.onAck)
+	srv.OnDisconnect(a.onDisconnect)
 	go a.run()
 	return a
 }
@@ -232,6 +233,7 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 			"subscription", clientID, "ack", ack)
 	}
 	a.metrics.subscribeAccepted()
+	a.metrics.sessionStarted()
 
 	a.mu.Lock()
 	if old, ok := a.destinations[clientID]; ok && old != destination {
@@ -395,4 +397,20 @@ func (a *messageQueueApp) onAck(headers map[string]string) {
 	if remaining > 0 {
 		a.tryDeliver(clientID)
 	}
+}
+
+// onDisconnect records that the client subscribed at headers["destination"]
+// is no longer connected, by any means (client DISCONNECT, network error, or
+// a server-initiated force-close via disconnectWithReason). A destination
+// this app never accepted a subscribe for (e.g. one onSubscribe rejected)
+// is silently ignored, the same as onAck already does for acks it doesn't
+// recognize.
+func (a *messageQueueApp) onDisconnect(headers map[string]string) {
+	a.mu.Lock()
+	_, ok := a.clientIDs[headers["destination"]]
+	a.mu.Unlock()
+	if !ok {
+		return
+	}
+	a.metrics.sessionEnded()
 }

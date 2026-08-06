@@ -16,6 +16,7 @@
     <h2>Server metrics</h2>
     <p>Polled directly from the message-queue app's Prometheus <code>/metrics</code> endpoint (same host as the WebSocket URL above). Starts once you click "Observe server" below, and then keeps polling independently of the WebSocket connection's own state.</p>
     <dl class="report-grid">
+      <div><dt>Connected clients</dt><dd id="m-connected-clients">—</dd></div>
       <div><dt>Active queues</dt><dd id="m-active-queues">—</dd></div>
       <div><dt>Queued events</dt><dd id="m-queued-events">—</dd></div>
       <div><dt>Subscriptions accepted</dt><dd id="m-sub-accepted">—</dd></div>
@@ -28,8 +29,6 @@
       <div><dt>Retries attempted</dt><dd id="m-retries">—</dd></div>
       <div><dt>Acks received</dt><dd id="m-acks">—</dd></div>
       <div><dt>Avg ack latency</dt><dd id="m-ack-latency">—</dd></div>
-      <div><dt>Disconnects (retry exhausted)</dt><dd id="m-disc-retry">—</dd></div>
-      <div><dt>Disconnects (queue overflow)</dt><dd id="m-disc-overflow">—</dd></div>
       <div><dt>Queue errors</dt><dd id="m-queue-errors">—</dd></div>
       <div><dt>Metrics last updated</dt><dd id="m-updated">—</dd></div>
     </dl>
@@ -97,6 +96,7 @@ async function pollMetrics(){
     const subAccepted=metricValue(m,'messagequeue_subscriptions_total',{outcome:'accepted'});
     const ackLatencySum=metricValue(m,'messagequeue_ack_latency_seconds_sum');
     const ackLatencyCount=metricValue(m,'messagequeue_ack_latency_seconds_count');
+    $('m-connected-clients').textContent=metricValue(m,'messagequeue_connected_clients');
     $('m-active-queues').textContent=metricValue(m,'messagequeue_active_queues');
     $('m-queued-events').textContent=metricValue(m,'messagequeue_queued_events');
     $('m-sub-accepted').textContent=subAccepted;
@@ -109,8 +109,6 @@ async function pollMetrics(){
     $('m-retries').textContent=metricValue(m,'messagequeue_retries_total');
     $('m-acks').textContent=metricValue(m,'messagequeue_acks_total');
     $('m-ack-latency').textContent=ackLatencyCount>0?(ackLatencySum/ackLatencyCount*1000).toFixed(1)+' ms':'—';
-    $('m-disc-retry').textContent=metricValue(m,'messagequeue_client_disconnects_total',{reason:'retry_exhausted'});
-    $('m-disc-overflow').textContent=metricValue(m,'messagequeue_client_disconnects_total',{reason:'queue_overflow'});
     $('m-queue-errors').textContent=metricValue(m,'messagequeue_queue_errors_total');
     $('m-updated').textContent=new Date().toLocaleTimeString();
     $('metrics-note').textContent='Polling '+target+' every 2s.';
