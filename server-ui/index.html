@@ -11,10 +11,10 @@
   <h1>STOMP Server UI</h1>
   <p>Server-side observer and publisher. The actual STOMP server remains the separate container listening on port 8080; this UI connects as an inspection subscription and auto-ACKs every message, so it stays compatible with the message-queue app's ack-gated delivery. If the server was started with <code>--htpasswd</code>, fill in Username/Password to authenticate.</p>
   <section class="card"><h2>Transport and negotiation</h2><div class="steps"><div id="http" class="step"><strong>1. HTTP</strong> — browser requests WebSocket Upgrade</div><div id="upgrade" class="step"><strong>2. HTTP 101</strong> — server accepts the protocol upgrade</div><div id="ws" class="step"><strong>3. WebSocket</strong> — bidirectional transport is open</div><div id="stomp" class="step"><strong>4. STOMP 1.2</strong> — CONNECT / CONNECTED / SUBSCRIBE</div><div id="heartbeat" class="step"><strong>5. Heartbeats</strong> — LF frames keep the connection alive</div></div></section>
-  <section class="card"><div class="form"><label>Server WebSocket URL<input id="url" value="ws://localhost:8080"></label><label>Subscription ID<input id="subscription" value="server-observer"></label><label>Destination<input id="destination" value="server-observer/demo-events"></label><label>Username (if --htpasswd)<input id="username" placeholder="leave blank for no auth"></label><label>Password<input id="password" type="password"></label></div><div class="actions"><button id="connect">Observe server</button><button id="disconnect" class="secondary">Disconnect</button><span id="status" class="status">Disconnected</span></div></section>
+  <section class="card"><div class="form"><label>Server WebSocket URL<input id="url" value="ws://localhost:8080"></label><label>Subscription ID<input id="subscription" value="server-observer"></label><label>Destination<input id="destination" value="server-observer/demo-events"></label><label>Username (if --htpasswd)<input id="username" placeholder="leave blank for no auth"></label><label>Password<input id="password" type="password"></label></div><div class="actions"><button id="connect">Connect &amp; subscribe</button><button id="unsubscribe" class="secondary">Unsubscribe</button><button id="disconnect" class="secondary">Disconnect</button><span id="status" class="status">Disconnected</span></div></section>
   <section class="card">
     <h2>Server metrics</h2>
-    <p>Polled directly from the message-queue app's Prometheus <code>/metrics</code> endpoint (same host as the WebSocket URL above). Starts once you click "Observe server" below, and then keeps polling independently of the WebSocket connection's own state.</p>
+    <p>Polled directly from the message-queue app's Prometheus <code>/metrics</code> endpoint (same host as the WebSocket URL above). This is independent of the STOMP connection above -- start it with "Watch metrics" below whether or not you've connected.</p>
     <dl class="report-grid">
       <div><dt>Connected clients</dt><dd id="m-connected-clients">—</dd></div>
       <div><dt>Active queues</dt><dd id="m-active-queues">—</dd></div>
@@ -32,7 +32,8 @@
       <div><dt>Queue errors</dt><dd id="m-queue-errors">—</dd></div>
       <div><dt>Metrics last updated</dt><dd id="m-updated">—</dd></div>
     </dl>
-    <p id="metrics-note" class="report-note">Click "Observe server" to start polling.</p>
+    <div class="actions"><button id="watch-metrics">Watch metrics</button><button id="stop-metrics" class="secondary">Stop watching</button><span id="metrics-status" class="status">Not watching</span></div>
+    <p id="metrics-note" class="report-note">Click "Watch metrics" to start polling.</p>
   </section>
   <div class="grid"><section class="card"><h2>Publish test event</h2><p>This sends a STOMP <code>SEND</code> frame through the server. Connected clients subscribed to this destination will receive a <code>MESSAGE</code>.</p><label>Payload<textarea id="payload" rows="5" style="width:100%;margin-top:5px;background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px;font:12px ui-monospace,monospace">{"source":"server-ui","message":"hello from the server-side demo"}</textarea></label><div class="actions"><button id="send">Send event</button></div></section><section class="card"><h2>Raw frames</h2><pre id="frames">No frames yet.</pre></section></div>
   <section class="card"><h2>Activity</h2><pre id="log">Ready.</pre></section>
@@ -56,14 +57,17 @@ function httpUrl(value){const url=new URL(value,window.location.href);if(url.pro
 // for the realm. The WebSocket handshake to the same origin right after
 // then picks up those cached credentials with no separate login prompt.
 function authProbe(url,user,pass){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open('GET',url,true,user,pass);xhr.onload=()=>xhr.status===401?reject(new Error('server rejected credentials (401)')):resolve();xhr.onerror=()=>reject(new Error('auth probe request failed'));xhr.send()})}
-async function connect(){startMetricsPolling();if(socket&&socket.readyState<2)socket.close();mark('http');const target=websocketUrl($('url').value);const user=$('username').value,pass=$('password').value;status('Connecting…');if(user){const probeUrl=httpUrl($('url').value);log('HTTP REQUEST → GET '+probeUrl+' (Basic auth preflight, so the browser caches credentials before the WebSocket handshake)');try{await authProbe(probeUrl,user,pass);log('Basic auth accepted for '+user)}catch(e){status('Auth failed','error');log('Basic auth preflight failed: '+e.message);return}}log('HTTP REQUEST → GET '+target+' with Upgrade: websocket');socket=new WebSocket(target);socket.binaryType='arraybuffer';socket.onopen=()=>{mark('upgrade');mark('ws');status('WebSocket open','connected');log('HTTP RESPONSE ← 101 Switching Protocols');log('WebSocket transport established');const ms=10000;send('CONNECT',{'accept-version':'1.2',host:'playground','heart-beat':`${ms},${ms}`});clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>{if(socket.readyState===1){socket.send('\n');mark('heartbeat');log('SERVER UI → SERVER  HEARTBEAT (LF)')}},ms)};socket.onmessage=e=>{const text=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);if(text==='\n'){mark('heartbeat');log('SERVER → SERVER UI  HEARTBEAT (LF)');return}$('frames').textContent='SERVER → SERVER UI\n\n'+text.replace(/\0/g,'<NUL>');log('SERVER → SERVER UI\n'+text.replace(/\0/g,'<NUL>'));const f=parse(text);if(f.command==='CONNECTED'){mark('stomp');send('SUBSCRIBE',{id:$('subscription').value,subscription:$('subscription').value,destination:$('destination').value,ack:'client-individual'})}else if(f.command==='MESSAGE'&&f.headers.ack){send('ACK',{id:f.headers.ack})}};socket.onerror=()=>{status('Connection error','error');log('connection error')};socket.onclose=()=>{clearInterval(heartbeatTimer);status('Disconnected');log('connection closed')}}
+async function connect(){if(socket&&socket.readyState<2)socket.close();mark('http');const target=websocketUrl($('url').value);const user=$('username').value,pass=$('password').value;status('Connecting…');if(user){const probeUrl=httpUrl($('url').value);log('HTTP REQUEST → GET '+probeUrl+' (Basic auth preflight, so the browser caches credentials before the WebSocket handshake)');try{await authProbe(probeUrl,user,pass);log('Basic auth accepted for '+user)}catch(e){status('Auth failed','error');log('Basic auth preflight failed: '+e.message);return}}log('HTTP REQUEST → GET '+target+' with Upgrade: websocket');socket=new WebSocket(target);socket.binaryType='arraybuffer';socket.onopen=()=>{mark('upgrade');mark('ws');status('WebSocket open','connected');log('HTTP RESPONSE ← 101 Switching Protocols');log('WebSocket transport established');const ms=10000;send('CONNECT',{'accept-version':'1.2',host:'playground','heart-beat':`${ms},${ms}`});clearInterval(heartbeatTimer);heartbeatTimer=setInterval(()=>{if(socket.readyState===1){socket.send('\n');mark('heartbeat');log('SERVER UI → SERVER  HEARTBEAT (LF)')}},ms)};socket.onmessage=e=>{const text=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);if(text==='\n'){mark('heartbeat');log('SERVER → SERVER UI  HEARTBEAT (LF)');return}$('frames').textContent='SERVER → SERVER UI\n\n'+text.replace(/\0/g,'<NUL>');log('SERVER → SERVER UI\n'+text.replace(/\0/g,'<NUL>'));const f=parse(text);if(f.command==='CONNECTED'){mark('stomp');send('SUBSCRIBE',{id:$('subscription').value,subscription:$('subscription').value,destination:$('destination').value,ack:'client-individual'})}else if(f.command==='MESSAGE'&&f.headers.ack){send('ACK',{id:f.headers.ack})}};socket.onerror=()=>{status('Connection error','error');log('connection error')};socket.onclose=()=>{clearInterval(heartbeatTimer);status('Disconnected');log('connection closed')}}
 function disconnect(){clearInterval(heartbeatTimer);if(socket&&socket.readyState===1){send('DISCONNECT');setTimeout(()=>socket.close(1000,'user disconnected'),100)}else status('Disconnected')}
+function unsubscribe(){if(!socket||socket.readyState!==1){log('Unsubscribe unavailable: connect first');return}send('UNSUBSCRIBE',{id:$('subscription').value})}
 function publish(){if(!socket||socket.readyState!==1){log('Send unavailable: connect first');return}let body;try{body=JSON.stringify(JSON.parse($('payload').value))}catch(e){log('Payload must be valid JSON');return}send('SEND',{destination:$('destination').value,'content-type':'application/json'},body)}
-$('connect').onclick=connect;$('disconnect').onclick=disconnect;$('send').onclick=publish;
+$('connect').onclick=connect;$('unsubscribe').onclick=unsubscribe;$('disconnect').onclick=disconnect;$('send').onclick=publish;
 
 // Server metrics: polled straight from the Go server's Prometheus /metrics
 // endpoint, over plain HTTP, independent of the STOMP WebSocket connection
-// above -- this table updates whether or not "Observe server" was clicked.
+// above -- started and stopped by its own "Watch metrics"/"Stop watching"
+// buttons, unrelated to whether "Connect & subscribe" was ever clicked.
+function metricsStatus(x,k=''){$('metrics-status').textContent=x;$('metrics-status').className='status '+k}
 function parseMetrics(text){
   const metrics={};
   for(const line of text.split('\n')){
@@ -86,6 +90,7 @@ async function pollMetrics(){
   try{
     target=new URL('metrics',httpUrl($('url').value));
   }catch(e){
+    metricsStatus('Error','error');
     $('metrics-note').textContent='Metrics unavailable: '+e.message;
     return;
   }
@@ -111,10 +116,14 @@ async function pollMetrics(){
     $('m-ack-latency').textContent=ackLatencyCount>0?(ackLatencySum/ackLatencyCount*1000).toFixed(1)+' ms':'—';
     $('m-queue-errors').textContent=metricValue(m,'messagequeue_queue_errors_total');
     $('m-updated').textContent=new Date().toLocaleTimeString();
+    metricsStatus('Watching','connected');
     $('metrics-note').textContent='Polling '+target+' every 2s.';
   }catch(e){
+    metricsStatus('Error','error');
     $('metrics-note').textContent='Metrics unavailable at '+target+': '+e.message;
   }
 }
-function startMetricsPolling(){if(metricsTimer)return;pollMetrics();metricsTimer=setInterval(pollMetrics,2000)}
+function startMetricsPolling(){if(metricsTimer)return;metricsStatus('Watching','connected');pollMetrics();metricsTimer=setInterval(pollMetrics,2000)}
+function stopMetricsPolling(){clearInterval(metricsTimer);metricsTimer=null;metricsStatus('Not watching');$('metrics-note').textContent='Stopped. Click "Watch metrics" to resume.'}
+$('watch-metrics').onclick=startMetricsPolling;$('stop-metrics').onclick=stopMetricsPolling;
 </script></body></html>
