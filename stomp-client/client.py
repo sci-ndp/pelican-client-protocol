@@ -15,7 +15,7 @@ import websockets
 from websockets.exceptions import WebSocketException
 
 from persistence import ClientPersistence
-from protocol import Frame, parse
+from protocol import Frame, parse, unsubscribe
 
 
 def basic_auth_header(username: str, password: str) -> str:
@@ -71,6 +71,10 @@ class StompClient:
             "graceful_disconnects": 0,
             "disconnect_receipts_received": 0,
             "disconnect_receipt_timeouts": 0,
+            "unsubscribe_requests": 0,
+            "unsubscribe_receipts_received": 0,
+            "unsubscribe_receipt_timeouts": 0,
+            "unsubscribe_rejections": 0,
             "immediate_disconnects": 0,
         }
         self.events_seen = 0
@@ -83,6 +87,9 @@ class StompClient:
         self.active_ws = None
         self.pending_disconnect_receipt = None
         self.disconnect_receipt_waiter = None
+        self.pending_unsubscribe_receipt = None
+        self.unsubscribe_receipt_waiter = None
+        self.subscription_active = False
         self.enabled = True
         self.wake = asyncio.Event()
         self.connection_state = "starting"
@@ -116,7 +123,7 @@ class StompClient:
 
     async def run(self) -> None:
         await asyncio.start_server(self.handle_http_request, "0.0.0.0", self.args.log_port)
-        self.log.info("application API listening address=0.0.0.0 port=%s paths=/logs,/messages,/report,/status,/config,/connect,/disconnect,/disconnect/graceful,/simulation/*", self.args.log_port)
+        self.log.info("application API listening address=0.0.0.0 port=%s paths=/logs,/messages,/report,/status,/config,/connect,/unsubscribe,/disconnect,/disconnect/graceful,/simulation/*", self.args.log_port)
         delay = 1
         while True:
             if not self.enabled:
@@ -168,6 +175,11 @@ class StompClient:
             "state": self.connection_state,
             "last_error": self.last_error,
             "session": self.session_headers,
+            "subscription": {
+                "id": self.subscription_key(),
+                "destination": self.destination(),
+                "active": self.subscription_active,
+            },
             "config": {
                 "url": self.args.url,
                 "subscription": self.subscription_key(),
@@ -223,6 +235,44 @@ class StompClient:
         if self.active_ws is not None:
             await self.active_ws.close(code=4000, reason="configuration updated")
 
+    async def unsubscribe(self) -> None:
+        """Remove the active STOMP subscription and wait for its receipt.
+
+        STOMP 1.2 requires id to exactly match the id sent in SUBSCRIBE. The
+        WebSocket remains open; state becomes inactive only on matching RECEIPT.
+        """
+        if self.active_ws is None or self.connection_state != "connected":
+            raise RuntimeError("cannot unsubscribe without an active STOMP session")
+        if not self.subscription_active:
+            raise RuntimeError("the STOMP subscription is already inactive")
+        if self.pending_unsubscribe_receipt:
+            raise RuntimeError("an unsubscribe request is already in progress")
+
+        receipt_id = f"unsubscribe-{uuid.uuid4()}"
+        waiter = asyncio.get_running_loop().create_future()
+        self.pending_unsubscribe_receipt = receipt_id
+        self.unsubscribe_receipt_waiter = waiter
+        self.delivery_metrics["unsubscribe_requests"] += 1
+        received = False
+        try:
+            await self.send(self.active_ws, unsubscribe(self.subscription_key(), receipt_id))
+            self.log.info("STOMP UNSUBSCRIBE sent id=%s receipt=%s; waiting for RECEIPT", self.subscription_key(), receipt_id)
+            received = await asyncio.wait_for(asyncio.shield(waiter), timeout=5)
+            if received:
+                self.log.info("unsubscribe receipt confirmed id=%s receipt=%s", self.subscription_key(), receipt_id)
+            else:
+                self.delivery_metrics["unsubscribe_receipt_timeouts"] += 1
+                self.last_error = f"UNSUBSCRIBE was not confirmed for receipt {receipt_id}"
+                self.log.warning("unsubscribe ended before receipt=%s was confirmed", receipt_id)
+        except asyncio.TimeoutError:
+            self.delivery_metrics["unsubscribe_receipt_timeouts"] += 1
+            self.last_error = f"UNSUBSCRIBE timed out waiting for receipt {receipt_id}"
+            self.log.warning("unsubscribe timed out waiting for receipt=%s", receipt_id)
+        finally:
+            if self.pending_unsubscribe_receipt == receipt_id:
+                self.pending_unsubscribe_receipt = None
+                self.unsubscribe_receipt_waiter = None
+
     async def graceful_disconnect(self) -> None:
         """Send DISCONNECT with a receipt request, then close after the matching RECEIPT."""
         if self.pending_disconnect_receipt:
@@ -271,8 +321,26 @@ class StompClient:
             self.enabled = False
             self.delivery_metrics["disconnect_receipts_received"] += 1
             self.log.info("server receipt matched graceful disconnect receipt=%s", receipt_id)
+        elif receipt_id == self.pending_unsubscribe_receipt and self.unsubscribe_receipt_waiter is not None:
+            if not self.unsubscribe_receipt_waiter.done():
+                self.unsubscribe_receipt_waiter.set_result(True)
+            self.subscription_active = False
+            self.delivery_metrics["unsubscribe_receipts_received"] += 1
+            self.log.info("server receipt matched unsubscribe id=%s receipt=%s", self.subscription_key(), receipt_id)
         else:
             self.log.info("server receipt received receipt=%s", receipt_id or "(missing)")
+
+    def handle_server_error(self, frame: Frame) -> None:
+        """Record server ERROR frames and resolve any rejected unsubscribe promptly."""
+        message = frame.body or frame.headers.get("message", "server ERROR")
+        self.delivery_metrics["server_error_frames"] += 1
+        self.log.error("server ERROR: %s", message)
+        if self.pending_unsubscribe_receipt and self.unsubscribe_receipt_waiter is not None:
+            self.delivery_metrics["unsubscribe_rejections"] += 1
+            self.last_error = f"UNSUBSCRIBE rejected by server: {message}"
+            if not self.unsubscribe_receipt_waiter.done():
+                self.unsubscribe_receipt_waiter.set_result(False)
+            self.log.warning("unsubscribe rejected before receipt=%s", self.pending_unsubscribe_receipt)
 
     def configure_simulation(self, payload: dict) -> None:
         path = payload.get("path")
@@ -332,6 +400,9 @@ class StompClient:
             elif method == "POST" and path == "/connect":
                 self.enabled = True
                 self.wake.set()
+                response, status = self.status_payload(), "200 OK"
+            elif method == "POST" and path == "/unsubscribe":
+                await self.unsubscribe()
                 response, status = self.status_payload(), "200 OK"
             elif method == "POST" and path == "/disconnect":
                 self.enabled = False
@@ -395,6 +466,7 @@ class StompClient:
                 subscription_id = self.subscription_key()
                 destination = self.destination()
                 await self.send(ws, Frame("SUBSCRIBE", {"id": subscription_id, "subscription": subscription_id, "destination": destination, "ack": "client-individual"}))
+                self.subscription_active = True
                 self.log.info("subscription active id=%s subscription=%s destination=%s ack_mode=client-individual", subscription_id, subscription_id, destination)
                 while self.enabled:
                     frame = await self.receive(ws)
@@ -403,12 +475,14 @@ class StompClient:
                     elif frame.command == "RECEIPT":
                         self.handle_receipt(frame)
                     elif frame.command == "ERROR":
-                        self.delivery_metrics["server_error_frames"] += 1
-                        self.log.error("server ERROR: %s", frame.body or frame.headers.get("message"))
+                        self.handle_server_error(frame)
         finally:
             self.active_ws = None
             if self.disconnect_receipt_waiter is not None and not self.disconnect_receipt_waiter.done():
                 self.disconnect_receipt_waiter.set_result(False)
+            if self.unsubscribe_receipt_waiter is not None and not self.unsubscribe_receipt_waiter.done():
+                self.unsubscribe_receipt_waiter.set_result(False)
+            self.subscription_active = False
             self.connection_state = "disconnected"
 
     async def send(self, ws, frame: Frame) -> None:

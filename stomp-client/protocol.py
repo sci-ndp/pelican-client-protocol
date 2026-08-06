@@ -25,3 +25,21 @@ def parse(raw: bytes) -> Frame:
             key, value = line.split(":", 1)
             headers[key] = value.replace("\\n", "\n").replace("\\r", "\r").replace("\\c", ":").replace("\\\\", "\\")
     return Frame(lines[0], headers, body)
+
+
+def unsubscribe(subscription_id: str, receipt: str | None = None) -> Frame:
+    '''Build a STOMP 1.2 UNSUBSCRIBE frame for the exact SUBSCRIBE id.
+
+    The STOMP 1.2 id header is mandatory and identifies the subscription to
+    remove. receipt is optional; callers can request it for confirmation.
+    '''
+    subscription_id = subscription_id.strip()
+    if not subscription_id:
+        raise ValueError("UNSUBSCRIBE requires a non-empty subscription id")
+    headers = {"id": subscription_id}
+    if receipt is not None:
+        receipt = receipt.strip()
+        if not receipt:
+            raise ValueError("UNSUBSCRIBE receipt must be non-empty when provided")
+        headers["receipt"] = receipt
+    return Frame("UNSUBSCRIBE", headers)

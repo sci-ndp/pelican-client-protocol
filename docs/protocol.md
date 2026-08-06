@@ -36,6 +36,24 @@ sequenceDiagram
 
 The generator does not subscribe and does not know which clients exist. It reconnects to the server and publishes an event at the configured interval. Delivery is live-only: a subscription only sees events published while it is active, matching plain STOMP 1.2 (there is no durable-subscription or replay concept in the base spec).
 
+## Unsubscribe lifecycle
+
+A STOMP 1.2 UNSUBSCRIBE frame removes one subscription from an otherwise open
+STOMP session. Its id header is mandatory and must exactly equal the id header
+sent on that subscription's SUBSCRIBE frame. It does not use the destination
+or application queue key as an identifier.
+
+The client sends an UNSUBSCRIBE frame with that id and a unique receipt header.
+The receipt is optional in STOMP 1.2, but this client requests it so the
+application layer can report whether the server processed the request. The
+client remains connected and marks the subscription inactive only after it
+receives RECEIPT with the same receipt-id. If no matching receipt arrives
+within five seconds, the client reports a timeout and keeps subscription state
+unchanged because removal was not confirmed. If the server sends an ERROR frame
+instead, the client reports the rejection immediately and also keeps the
+subscription active. Applying settings/reconnecting creates a new STOMP session
+and sends a new SUBSCRIBE.
+
 ## ACK/NACK model
 
 `SUBSCRIBE`'s `ack` header controls how `MESSAGE` frames from that subscription must be acknowledged:
