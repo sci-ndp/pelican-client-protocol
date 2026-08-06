@@ -121,6 +121,17 @@ func (m *appMetrics) subscribeRejected(reason string) {
 
 func (m *appMetrics) queueCreated() { m.activeQueues.Inc() }
 
+// queueResumed seeds queuedEvents with n events a durable queue already had
+// on disk before this process ever built an in-process handle for that
+// client. Without this, a backlog resumed from a prior process run is
+// invisible to the gauge until it's delivered -- at which point the
+// resulting eventDelivered() decrement has no matching eventEnqueued()
+// increment (from *this* process) to balance against, driving the gauge
+// negative.
+func (m *appMetrics) queueResumed(n int) {
+	m.queuedEvents.Add(float64(n))
+}
+
 // eventEnqueued records one event successfully appended to a client queue.
 func (m *appMetrics) eventEnqueued() {
 	m.eventsEnqueued.Inc()

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func discardLogger() *slog.Logger {
@@ -575,5 +577,46 @@ func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	}
 	if publishes[0].body != "Event 1" {
 		t.Errorf("resumed body = %q, want %q", publishes[0].body, "Event 1")
+	}
+
+	// The resumed backlog (1 event, persisted by app1, never seen as
+	// "enqueued" by app2's own metrics) must be reflected in app2's gauge
+	// immediately, not just once it's delivered.
+	if got := testutil.ToFloat64(app2.metrics.queuedEvents); got != 1 {
+		t.Fatalf("queuedEvents after resuming a 1-event backlog = %v, want 1", got)
+	}
+
+	app2.onAck(map[string]string{"destination": "carol/testsource", "message-id": publishes[0].messageID})
+	if got := testutil.ToFloat64(app2.metrics.queuedEvents); got != 0 {
+		t.Errorf("queuedEvents after acking the resumed event = %v, want 0 (must not go negative)", got)
+	}
+}
+
+func TestOnSubscribe_ReconnectWithoutRestartDoesNotDoubleCountGauge(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "queue.sqlite3")
+	db, err := openQueueDB(dbPath)
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	app.newQueue = sqliteQueueFactory(db)
+	srv.setConnected("dave/testsource", true)
+
+	app.onSubscribe(subscribeHeaders("dave"))
+	app.onEvent("Event 1") // delivered but never acked
+
+	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 1 {
+		t.Fatalf("queuedEvents after first subscribe+event = %v, want 1", got)
+	}
+
+	// Reconnects without a process restart: existed is true this time, so
+	// the gauge must not be re-seeded from the durable backlog -- that
+	// backlog is the SAME event already counted once, not a new one.
+	app.onSubscribe(subscribeHeaders("dave"))
+
+	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 1 {
+		t.Errorf("queuedEvents after in-process reconnect = %v, want still 1 (must not double-count)", got)
 	}
 }

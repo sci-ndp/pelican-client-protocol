@@ -257,6 +257,14 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 		a.log.Warn("queue length check failed", "subscription", clientID, "error", err)
 		a.metrics.queueErrorOccurred("len")
 	} else if existed || n > 0 {
+		if !existed {
+			// This process just built its first in-process handle for
+			// clientID, but the durable queue already had n events from a
+			// prior process run -- seed the gauge so it isn't silently
+			// undercounted (and eventually driven negative) once they're
+			// delivered and acked.
+			a.metrics.queueResumed(n)
+		}
 		a.log.Info("resumed existing event queue", "subscription", clientID, "queued", n)
 	} else {
 		a.log.Info("created new event queue", "subscription", clientID)
