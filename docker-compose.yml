@@ -1,13 +1,29 @@
 services:
   server:
     build: ./stomp-server-go
-    command: stomp-server-go --port 8080
+    # QUEUE_DB and TEST_EVENT_SEQ_FILE are opt-in: leave them unset for the
+    # default in-memory queue and non-persistent demo ticker, or set them
+    # (e.g. QUEUE_DB=/data/queue.sqlite3, TEST_EVENT_SEQ_FILE=/data/event-seq.txt)
+    # to persist the client queues and event sequence number in /data across
+    # container restarts. --queue-db is a CLI flag rather than an env var on
+    # the server binary, so this wraps the command in a shell to only pass it
+    # when QUEUE_DB is set.
+    command: >
+      sh -c 'exec stomp-server-go --port 8080 $${QUEUE_DB:+--queue-db "$$QUEUE_DB"}'
+    environment:
+      QUEUE_DB: /etc/data/queue.sqlite
+      TEST_EVENT_SEQ_FILE: /etc/data/seq.txt
     ports:
       - "8080:8080"
+    volumes:
+      - db-data:/etc/data
 
   client:
     build: ./stomp-client
-    command: python client.py --destination /origin/demo --client-id playground-client --reconnect --log-level ${LOG_LEVEL:-INFO}
+    # event-source must match whichever event source the server is actually
+    # running (see the server service above): the seq-file one, since
+    # TEST_EVENT_SEQ_FILE is set unconditionally there.
+    command: python client.py --event-source seq-events --client-id playground-client --reconnect --log-level ${LOG_LEVEL:-INFO}
     environment:
       STOMP_URL: ws://server:8080
       CLIENT_DB: /data/client.sqlite3
@@ -38,3 +54,5 @@ services:
       - "8000:8000"
     depends_on:
       - server
+volumes:
+  db-data:
