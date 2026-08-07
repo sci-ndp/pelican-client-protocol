@@ -32,20 +32,27 @@ type clientQueue interface {
 }
 
 // queueFactory creates the clientQueue for a client id the app has not yet
-// built an in-process handle for. A durable implementation (like
+// built an in-process handle for, given the subscription parameters (the
+// destination's contents after "<clientID>/", see subscriptionParams) that
+// client most recently subscribed with. A durable implementation (like
 // sqliteClientQueue) may transparently resume rows a prior process run
 // already wrote for that client id.
-type queueFactory func(clientID string) clientQueue
+type queueFactory func(clientID string, params string) clientQueue
 
 // memoryClientQueue is a clientQueue backed by a plain in-process slice.
 // Its contents are lost when the process exits.
 type memoryClientQueue struct {
 	events []string // oldest first
+
+	// params is the subscription parameters this client's queue was created
+	// with (see queueFactory). Stored for future use; nothing yet
+	// interprets its contents.
+	params string
 }
 
 // newMemoryClientQueue is a queueFactory.
-func newMemoryClientQueue(clientID string) clientQueue {
-	return &memoryClientQueue{}
+func newMemoryClientQueue(clientID string, params string) clientQueue {
+	return &memoryClientQueue{params: params}
 }
 
 func (q *memoryClientQueue) Enqueue(event string, cap int) (bool, error) {

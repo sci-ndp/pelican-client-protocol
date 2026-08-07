@@ -47,12 +47,17 @@ func openQueueDB(path string) (*sql.DB, error) {
 type sqliteClientQueue struct {
 	db       *sql.DB
 	clientID string
+
+	// params is the subscription parameters this client's queue was created
+	// with (see queueFactory). Stored for future use; nothing yet
+	// interprets its contents.
+	params string
 }
 
 // sqliteQueueFactory returns a queueFactory whose clientQueues all share db.
 func sqliteQueueFactory(db *sql.DB) queueFactory {
-	return func(clientID string) clientQueue {
-		return &sqliteClientQueue{db: db, clientID: clientID}
+	return func(clientID string, params string) clientQueue {
+		return &sqliteClientQueue{db: db, clientID: clientID, params: params}
 	}
 }
 

@@ -572,6 +572,74 @@ func TestHasOwningSegment(t *testing.T) {
 	}
 }
 
+func TestSubscriptionParams(t *testing.T) {
+	cases := []struct {
+		destination string
+		want        string
+	}{
+		{"alice", ""},                // bare client id, no params
+		{"alice/foo", "foo"},         // simple params
+		{"alice/foo/bar", "foo/bar"}, // nested/multi-segment params, kept whole
+		{"alice/", ""},               // trailing slash: empty params, not absent
+		{"", ""},                     // empty destination
+		{"/alice/foo", "alice/foo"},  // leading slash: everything after the first "/"
+	}
+	for _, c := range cases {
+		if got := subscriptionParams(c.destination); got != c.want {
+			t.Errorf("subscriptionParams(%q) = %q, want %q", c.destination, got, c.want)
+		}
+	}
+}
+
+func TestOnSubscribe_PassesSubscriptionParamsToQueueFactory(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/topic=weather&qos=1", true)
+
+	var gotClientID, gotParams string
+	app.newQueue = func(clientID, params string) clientQueue {
+		gotClientID, gotParams = clientID, params
+		return newMemoryClientQueue(clientID, params)
+	}
+
+	app.onSubscribe(map[string]string{
+		"subscription": "alice",
+		"destination":  "alice/topic=weather&qos=1",
+		"ack":          "client-individual",
+	})
+
+	if gotClientID != "alice" {
+		t.Errorf("queueFactory clientID = %q, want alice", gotClientID)
+	}
+	if gotParams != "topic=weather&qos=1" {
+		t.Errorf("queueFactory params = %q, want topic=weather&qos=1", gotParams)
+	}
+}
+
+func TestOnSubscribe_ResubscribeDoesNotRecreateQueueOrReinvokeFactory(t *testing.T) {
+	// The factory is only called once per clientID, the first time this
+	// process builds an in-process handle -- a resubscribe (even with
+	// different params) reuses the existing queue rather than calling the
+	// factory again. Documenting this existing, unchanged behavior here
+	// since it's now directly relevant to whether new params ever reach an
+	// existing queue (they don't, today).
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/first", true)
+
+	calls := 0
+	app.newQueue = func(clientID, params string) clientQueue {
+		calls++
+		return newMemoryClientQueue(clientID, params)
+	}
+
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/first", "ack": "client-individual"})
+	srv.setConnected("alice/second", true)
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/second", "ack": "client-individual"})
+
+	if calls != 1 {
+		t.Errorf("queueFactory called %d times, want 1 (only on first subscribe)", calls)
+	}
+}
+
 func TestOnSubscribe_RejectsDestinationNotOwnedByClient(t *testing.T) {
 	app, srv := newTestApp(defaultMessageQueueConfig)
 	srv.setConnected("bob/something", true)

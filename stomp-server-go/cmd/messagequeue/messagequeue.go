@@ -238,14 +238,26 @@ func (a *messageQueueApp) disconnectWithReason(destination, reason string) {
 
 // hasOwningSegment reports whether destination's first "/"-delimited segment
 // is exactly clientID -- i.e. destination is clientID itself, or
-// "<clientID>/<anything>". This is what stops one client from subscribing to
-// a destination namespaced under a different client's id.
+// "<clientID>/<subscription parameters>". This is what stops one client from
+// subscribing to a destination namespaced under a different client's id.
 func hasOwningSegment(destination, clientID string) bool {
 	segment := destination
 	if idx := strings.IndexByte(destination, '/'); idx >= 0 {
 		segment = destination[:idx]
 	}
 	return segment == clientID
+}
+
+// subscriptionParams returns destination's subscription parameters -- its
+// contents after the client's own leading "<clientID>/" segment (already
+// verified separately by hasOwningSegment), or "" if destination has no "/"
+// at all. These are passed to queueFactory when a client's queue is first
+// created; nothing yet interprets their contents.
+func subscriptionParams(destination string) string {
+	if idx := strings.IndexByte(destination, '/'); idx >= 0 {
+		return destination[idx+1:]
+	}
+	return ""
 }
 
 // onSubscribe creates a new event queue the first time a client's
@@ -255,9 +267,10 @@ func hasOwningSegment(destination, clientID string) bool {
 // the client's destination is (re)recorded as wherever this SUBSCRIBE named
 // -- future deliveries for this client always go back there, regardless of
 // what it was on a previous connection. The destination's first path segment
-// must be the client's own subscription id (any suffix after that is free
-// choice), so one client can never subscribe to a destination namespaced
-// under a different client's id.
+// must be the client's own subscription id; everything after that is this
+// client's subscription parameters (see subscriptionParams), so one client
+// can never subscribe to a destination namespaced under a different
+// client's id.
 func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	clientID := headers["subscription"]
 	destination := headers["destination"]
@@ -287,7 +300,7 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 
 	q, existed := a.queues[clientID]
 	if !existed {
-		q = a.newQueue(clientID)
+		q = a.newQueue(clientID, subscriptionParams(destination))
 		a.queues[clientID] = q
 	}
 	a.clearInFlight(clientID)

@@ -170,7 +170,7 @@ func (brokenClientQueue) Delete() error                     { return errors.New(
 
 func TestMetrics_QueueErrorsRecordedByOperation(t *testing.T) {
 	app, srv := newTestApp(defaultMessageQueueConfig)
-	app.newQueue = func(string) clientQueue { return brokenClientQueue{} }
+	app.newQueue = func(string, string) clientQueue { return brokenClientQueue{} }
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice")) // Len() fails during onSubscribe's resume check

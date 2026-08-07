@@ -105,7 +105,27 @@ func testClientQueueContract(t *testing.T, newQueue func() clientQueue) {
 }
 
 func TestMemoryClientQueue_Contract(t *testing.T) {
-	testClientQueueContract(t, func() clientQueue { return newMemoryClientQueue("test") })
+	testClientQueueContract(t, func() clientQueue { return newMemoryClientQueue("test", "") })
+}
+
+func TestMemoryClientQueue_StoresSubscriptionParams(t *testing.T) {
+	q := newMemoryClientQueue("alice", "topic=weather&qos=1").(*memoryClientQueue)
+	if q.params != "topic=weather&qos=1" {
+		t.Errorf("params = %q, want topic=weather&qos=1", q.params)
+	}
+}
+
+func TestSQLiteClientQueue_StoresSubscriptionParams(t *testing.T) {
+	db, err := openQueueDB(filepath.Join(t.TempDir(), "queue.sqlite3"))
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	q := sqliteQueueFactory(db)("alice", "topic=weather&qos=1").(*sqliteClientQueue)
+	if q.params != "topic=weather&qos=1" {
+		t.Errorf("params = %q, want topic=weather&qos=1", q.params)
+	}
 }
 
 func TestSQLiteClientQueue_Contract(t *testing.T) {
@@ -121,7 +141,7 @@ func TestSQLiteClientQueue_Contract(t *testing.T) {
 		n++
 		// A distinct client id per subtest, since all subtests share one
 		// underlying database/table.
-		return factory(fmt.Sprintf("client-%d", n))
+		return factory(fmt.Sprintf("client-%d", n), "")
 	})
 }
 
@@ -133,7 +153,7 @@ func TestSQLiteClientQueue_IsolatesByClientID(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	factory := sqliteQueueFactory(db)
 
-	alice, bob := factory("alice"), factory("bob")
+	alice, bob := factory("alice", ""), factory("bob", "")
 	if _, err := alice.Enqueue("a1", 100); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -157,7 +177,7 @@ func TestSQLiteClientQueue_DeleteOnlyAffectsOwnClientID(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	factory := sqliteQueueFactory(db)
 
-	alice, bob := factory("alice"), factory("bob")
+	alice, bob := factory("alice", ""), factory("bob", "")
 	if _, err := alice.Enqueue("a1", 100); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -184,7 +204,7 @@ func TestSQLiteClientQueue_PersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openQueueDB: %v", err)
 	}
-	q1 := sqliteQueueFactory(db1)("alice")
+	q1 := sqliteQueueFactory(db1)("alice", "")
 	if _, err := q1.Enqueue("Event 1", 100); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -201,7 +221,7 @@ func TestSQLiteClientQueue_PersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("reopen openQueueDB: %v", err)
 	}
 	t.Cleanup(func() { db2.Close() })
-	q2 := sqliteQueueFactory(db2)("alice")
+	q2 := sqliteQueueFactory(db2)("alice", "")
 
 	got, ok, err := q2.PeekFront()
 	if err != nil || !ok {
