@@ -86,6 +86,7 @@ func execPelicanListing(pelicanBinary string) pelicanListingRunner {
 // pre-existing file. "New" specifically means "appeared since the last
 // poll", not "exists".
 type pelicanListingEventSource struct {
+	defaultNotifier
 	listingURL string
 	statePath  string
 	list       pelicanListingRunner

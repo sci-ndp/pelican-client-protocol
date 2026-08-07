@@ -129,9 +129,11 @@ func (f *fakeStompServer) snapshotSentErrors() []sentError {
 // fakeEventSource is an EventSource test double whose channel a test can
 // feed directly, though most tests below call messageQueueApp's methods
 // directly instead, since that avoids any timing dependency on the app's
-// background run() goroutine.
+// background run() goroutine. ShouldNotify defaults to always-true; a test
+// that needs to exercise per-client filtering sets shouldNotify directly.
 type fakeEventSource struct {
-	ch chan string
+	ch           chan string
+	shouldNotify func(event string, q clientQueue) bool
 }
 
 func newFakeEventSource() *fakeEventSource {
@@ -139,6 +141,13 @@ func newFakeEventSource() *fakeEventSource {
 }
 
 func (f *fakeEventSource) Events() <-chan string { return f.ch }
+
+func (f *fakeEventSource) ShouldNotify(event string, q clientQueue) bool {
+	if f.shouldNotify != nil {
+		return f.shouldNotify(event, q)
+	}
+	return true
+}
 
 func newTestApp(cfg messageQueueConfig) (*messageQueueApp, *fakeStompServer) {
 	srv := newFakeStompServer()
@@ -174,6 +183,55 @@ func TestOnEvent_DropsWhenNoQueuesRegistered(t *testing.T) {
 
 	if got := srv.snapshotPublishes(); len(got) != 0 {
 		t.Fatalf("Publish calls = %v, want none", got)
+	}
+}
+
+func TestOnEvent_SkipsClientsShouldNotifyRejects(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	srv.setConnected("bob/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(subscribeHeaders("bob"))
+
+	app.mu.Lock()
+	bobQueue := app.queues["bob"]
+	app.mu.Unlock()
+
+	// ShouldNotify runs while onEvent holds a.mu, so this must not lock it
+	// itself -- compare against the queue captured above instead of looking
+	// it up again.
+	source := app.source.(*fakeEventSource)
+	source.shouldNotify = func(event string, q clientQueue) bool { return q != bobQueue }
+
+	app.onEvent("Event 1")
+
+	publishes := srv.snapshotPublishes()
+	if len(publishes) != 1 {
+		t.Fatalf("Publish calls = %d, want 1 (only alice): %+v", len(publishes), publishes)
+	}
+	if publishes[0].destination != "alice/testsource" {
+		t.Errorf("destination = %q, want alice/testsource", publishes[0].destination)
+	}
+	if n, err := bobQueue.Len(); err != nil || n != 0 {
+		t.Errorf("bob's queue Len() = (%d, %v), want (0, nil) -- event should never have been enqueued for bob", n, err)
+	}
+}
+
+func TestOnEvent_ShouldNotifyRejectingEveryoneIsNotCountedAsDropped(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice"))
+
+	source := app.source.(*fakeEventSource)
+	source.shouldNotify = func(event string, q clientQueue) bool { return false }
+
+	app.onEvent("Event 1")
+
+	if got := srv.snapshotPublishes(); len(got) != 0 {
+		t.Fatalf("Publish calls = %v, want none", got)
+	}
+	if got := testutil.ToFloat64(app.metrics.eventsDropped); got != 0 {
+		t.Errorf("eventsDropped = %v, want 0 (queues existed, ShouldNotify just filtered them all)", got)
 	}
 }
 

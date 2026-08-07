@@ -177,10 +177,12 @@ func (a *messageQueueApp) queuedEventCount() int {
 
 // onEvent implements the fan-out and 100-cap policy: while there are no
 // registered queues, new events are dropped; once at least one exists, the
-// event is appended to every queue, capped at cfg.maxQueueLen by dropping the
-// oldest entries. A client that's currently connected and whose queue just
+// event is appended to every queue whose client the EventSource's
+// ShouldNotify accepts, capped at cfg.maxQueueLen by dropping the oldest
+// entries. A client that's currently connected and whose queue just
 // overflowed is disconnected; an offline client is simply trimmed, since
-// there's no connection to give up on.
+// there's no connection to give up on. A client ShouldNotify rejects this
+// event for is skipped entirely -- as if the event never happened for them.
 func (a *messageQueueApp) onEvent(event string) {
 	a.mu.Lock()
 	if len(a.queues) == 0 {
@@ -192,6 +194,9 @@ func (a *messageQueueApp) onEvent(event string) {
 	var toDisconnect []string
 	var toDeliver []string
 	for clientID, q := range a.queues {
+		if !a.source.ShouldNotify(event, q) {
+			continue
+		}
 		overflowed, err := q.Enqueue(event, a.cfg.maxQueueLen)
 		if err != nil {
 			a.log.Error("queue enqueue failed", "subscription", clientID, "error", err)

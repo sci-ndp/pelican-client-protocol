@@ -15,6 +15,7 @@ import (
 // process resumes counting up from where it left off instead of starting
 // over at 1.
 type seqFileEventSource struct {
+	defaultNotifier
 	path string
 	log  *slog.Logger
 	ch   chan string
