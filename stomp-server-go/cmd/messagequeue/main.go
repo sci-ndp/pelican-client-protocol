@@ -7,6 +7,9 @@ import (
 	"os"
 	"time"
 
+	"stomp-server-go/internal/clientqueue"
+	"stomp-server-go/internal/eventsource"
+	"stomp-server-go/internal/messagequeue"
 	"stomp-server-go/internal/stomp"
 )
 
@@ -55,18 +58,18 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/", stomp.RequireAuth(authenticator, listener))
 
-	newQueue := queueFactory(newMemoryClientQueue)
-	var persistedClients []persistedClient
+	newQueue := clientqueue.Factory(clientqueue.NewMemoryQueue)
+	var persistedClients []clientqueue.PersistedClient
 	if *queueDB != "" {
-		db, err := openQueueDB(*queueDB)
+		db, err := clientqueue.OpenDB(*queueDB)
 		if err != nil {
 			logger.Error("failed to open queue database", "error", err)
 			os.Exit(1)
 		}
-		newQueue = sqliteQueueFactory(db, logger)
+		newQueue = clientqueue.SQLiteFactory(db, logger)
 		logger.Info("using on-disk client queues", "queue-db", *queueDB)
 
-		persistedClients, err = listPersistedClients(db)
+		persistedClients, err = clientqueue.ListPersistedClients(db)
 		if err != nil {
 			logger.Error("failed to list persisted clients", "error", err)
 			os.Exit(1)
@@ -81,14 +84,14 @@ func main() {
 	// ticker. The Pelican watcher doesn't take a fixed directory: it derives
 	// what to watch dynamically from each client's own subscription
 	// parameters (see pelicanDirectoryFromParams), via QueueAdded/
-	// QueueRemoved hooks messageQueueApp calls as clients (un)subscribe.
-	var source EventSource
+	// QueueRemoved hooks messagequeue.App calls as clients (un)subscribe.
+	var source eventsource.EventSource
 	if *pelicanEnabled {
 		if *pelicanStateFile == "" {
 			logger.Error("--pelican-state-file is required when --pelican-enabled is set")
 			os.Exit(1)
 		}
-		pelicanSource, err := newPelicanListingEventSource(*pelicanPollInterval, *pelicanStateFile, *pelicanBinary, logger)
+		pelicanSource, err := eventsource.NewPelicanListingSource(*pelicanPollInterval, *pelicanStateFile, *pelicanBinary, logger)
 		if err != nil {
 			logger.Error("failed to start Pelican directory listing watcher", "error", err)
 			os.Exit(1)
@@ -96,7 +99,7 @@ func main() {
 		source = pelicanSource
 		logger.Info("watching Pelican directories named by client subscription parameters", "poll-interval", *pelicanPollInterval, "state-file", *pelicanStateFile)
 	} else if seqFile := os.Getenv("TEST_EVENT_SEQ_FILE"); seqFile != "" {
-		seqSource, err := newSeqFileEventSource(seqFile, eventInterval, logger)
+		seqSource, err := eventsource.NewSeqFileSource(seqFile, eventInterval, logger)
 		if err != nil {
 			logger.Error("failed to start persistent sequence event source", "path", seqFile, "error", err)
 			os.Exit(1)
@@ -104,12 +107,12 @@ func main() {
 		source = seqSource
 		logger.Info("using persistent sequence event source", "TEST_EVENT_SEQ_FILE", seqFile)
 	} else {
-		source = newTickerEventSource(eventInterval)
+		source = eventsource.NewTickerSource(eventInterval)
 		logger.Info("using in-memory demo ticker event source")
 	}
 
 	srv := stomp.NewServer(logger)
-	app := newMessageQueueApp(srv, logger, source, newQueue)
+	app := messagequeue.New(srv, logger, source, newQueue)
 	// Pre-populate queues (and notify source) for durable clients from a
 	// prior process run, before serving any connections -- otherwise e.g.
 	// the Pelican watcher wouldn't know to watch their directories until

@@ -1,4 +1,4 @@
-package main
+package clientqueue
 
 import (
 	"database/sql"
@@ -8,14 +8,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// openQueueDB opens (creating if necessary) the SQLite database at path used
-// to back sqliteClientQueue, and ensures its schema exists. The returned DB
-// is restricted to a single open connection: messageQueueApp already
-// serializes every queue operation through its own mutex, so there's never
+// OpenDB opens (creating if necessary) the SQLite database at path used to
+// back the SQLite Queue implementation, and ensures its schema exists. The
+// returned DB is restricted to a single open connection: callers already
+// serialize every queue operation through their own mutex, so there's never
 // more than one goroutine touching the database at a time, and forcing a
 // single connection sidesteps SQLite "database is locked" errors that
 // otherwise show up under Go's default connection pooling.
-func openQueueDB(path string) (*sql.DB, error) {
+func OpenDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open queue database: %w", err)
@@ -42,12 +42,10 @@ func openQueueDB(path string) (*sql.DB, error) {
 	}
 	// client_metadata records each client's subscription parameters
 	// separately from its queued events, so a restarted process can
-	// rehydrate which clients (and, for an EventSource that cares, which
-	// directories/etc. their params name) existed before any of them
-	// reconnect -- see messageQueueApp.RehydrateQueues and
-	// listPersistedClients. Deliberately its own table rather than a column
-	// on queue_events: params describe the client, not any one event, and
-	// a client's queue can be legitimately empty (all events delivered and
+	// rehydrate which clients existed before any of them reconnect -- see
+	// ListPersistedClients. Deliberately its own table rather than a column
+	// on queue_events: params describe the client, not any one event, and a
+	// client's queue can be legitimately empty (all events delivered and
 	// acked) while it's still a client this process should remember.
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS client_metadata (
@@ -61,36 +59,33 @@ func openQueueDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// sqliteClientQueue is a clientQueue backed by a shared SQLite database,
-// scoped to one client_id. Its contents survive process restarts.
-type sqliteClientQueue struct {
+// sqliteQueue is a Queue backed by a shared SQLite database, scoped to one
+// client_id. Its contents survive process restarts.
+type sqliteQueue struct {
 	db       *sql.DB
 	clientID string
-
-	// params is the subscription parameters this client's queue was created
-	// with (see queueFactory and Params).
-	params string
+	params   string // subscription parameters this queue was created with (see Factory and Params)
 }
 
-// sqliteQueueFactory returns a queueFactory whose clientQueues all share db.
-// Every call records clientID's current params in client_metadata (an
-// upsert, so calling it again for a clientID that already has a row just
-// refreshes its params) -- this runs for both a genuine new SUBSCRIBE and a
-// startup rehydration (see messageQueueApp.RehydrateQueues), so
-// client_metadata self-heals if it's ever behind what queue_events has.
-func sqliteQueueFactory(db *sql.DB, log *slog.Logger) queueFactory {
-	return func(clientID string, params string) clientQueue {
+// SQLiteFactory returns a Factory whose Queues all share db. Every call
+// records clientID's current params in client_metadata (an upsert, so
+// calling it again for a clientID that already has a row just refreshes its
+// params) -- this runs for both a genuine new SUBSCRIBE and a startup
+// rehydration (see messagequeue.App.RehydrateQueues), so client_metadata
+// self-heals if it's ever behind what queue_events has.
+func SQLiteFactory(db *sql.DB, log *slog.Logger) Factory {
+	return func(clientID string, params string) Queue {
 		if _, err := db.Exec(`
 			INSERT INTO client_metadata (client_id, params) VALUES (?, ?)
 			ON CONFLICT(client_id) DO UPDATE SET params = excluded.params
 		`, clientID, params); err != nil {
 			log.Error("failed to persist client metadata", "client_id", clientID, "error", err)
 		}
-		return &sqliteClientQueue{db: db, clientID: clientID, params: params}
+		return &sqliteQueue{db: db, clientID: clientID, params: params}
 	}
 }
 
-func (q *sqliteClientQueue) Enqueue(event string, cap int) (bool, error) {
+func (q *sqliteQueue) Enqueue(event string, cap int) (bool, error) {
 	tx, err := q.db.Begin()
 	if err != nil {
 		return false, fmt.Errorf("begin: %w", err)
@@ -119,7 +114,7 @@ func (q *sqliteClientQueue) Enqueue(event string, cap int) (bool, error) {
 	return dropped > 0, nil
 }
 
-func (q *sqliteClientQueue) PeekFront() (string, bool, error) {
+func (q *sqliteQueue) PeekFront() (string, bool, error) {
 	var body string
 	err := q.db.QueryRow(`SELECT body FROM queue_events WHERE client_id = ? ORDER BY id ASC LIMIT 1`, q.clientID).Scan(&body)
 	if err == sql.ErrNoRows {
@@ -131,7 +126,7 @@ func (q *sqliteClientQueue) PeekFront() (string, bool, error) {
 	return body, true, nil
 }
 
-func (q *sqliteClientQueue) PopFront() error {
+func (q *sqliteQueue) PopFront() error {
 	_, err := q.db.Exec(`
 		DELETE FROM queue_events WHERE id = (
 			SELECT id FROM queue_events WHERE client_id = ? ORDER BY id ASC LIMIT 1
@@ -143,7 +138,7 @@ func (q *sqliteClientQueue) PopFront() error {
 	return nil
 }
 
-func (q *sqliteClientQueue) Len() (int, error) {
+func (q *sqliteQueue) Len() (int, error) {
 	var n int
 	if err := q.db.QueryRow(`SELECT COUNT(*) FROM queue_events WHERE client_id = ?`, q.clientID).Scan(&n); err != nil {
 		return 0, fmt.Errorf("len: %w", err)
@@ -151,7 +146,7 @@ func (q *sqliteClientQueue) Len() (int, error) {
 	return n, nil
 }
 
-func (q *sqliteClientQueue) Delete() error {
+func (q *sqliteQueue) Delete() error {
 	if _, err := q.db.Exec(`DELETE FROM queue_events WHERE client_id = ?`, q.clientID); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
@@ -161,29 +156,29 @@ func (q *sqliteClientQueue) Delete() error {
 	return nil
 }
 
-func (q *sqliteClientQueue) Params() string { return q.params }
+func (q *sqliteQueue) Params() string { return q.params }
 
-// persistedClient is one client_id/params pair recorded in client_metadata.
-type persistedClient struct {
-	clientID string
-	params   string
+// PersistedClient is one client_id/params pair recorded in client_metadata.
+type PersistedClient struct {
+	ClientID string
+	Params   string
 }
 
-// listPersistedClients reads every client_id/params pair client_metadata
+// ListPersistedClients reads every client_id/params pair client_metadata
 // currently has, so a restarted process can rehydrate its in-memory client
-// queues (see messageQueueApp.RehydrateQueues) for durable clients that
+// queues (see messagequeue.App.RehydrateQueues) for durable clients that
 // haven't reconnected yet.
-func listPersistedClients(db *sql.DB) ([]persistedClient, error) {
+func ListPersistedClients(db *sql.DB) ([]PersistedClient, error) {
 	rows, err := db.Query(`SELECT client_id, params FROM client_metadata`)
 	if err != nil {
 		return nil, fmt.Errorf("list persisted clients: %w", err)
 	}
 	defer rows.Close()
 
-	var clients []persistedClient
+	var clients []PersistedClient
 	for rows.Next() {
-		var c persistedClient
-		if err := rows.Scan(&c.clientID, &c.params); err != nil {
+		var c PersistedClient
+		if err := rows.Scan(&c.ClientID, &c.Params); err != nil {
 			return nil, fmt.Errorf("scan persisted client: %w", err)
 		}
 		clients = append(clients, c)

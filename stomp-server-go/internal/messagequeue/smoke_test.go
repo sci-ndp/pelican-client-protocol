@@ -1,4 +1,4 @@
-package main
+package messagequeue
 
 import (
 	"fmt"
@@ -10,6 +10,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"stomp-server-go/internal/clientqueue"
+	"stomp-server-go/internal/eventsource"
 	"stomp-server-go/internal/stomp"
 )
 
@@ -30,9 +32,9 @@ func parseHeader(frame, key string) string {
 }
 
 // TestSmokeEndToEnd exercises the full real stack (real HTTP server, real
-// WebSocket upgrade, real Server, real messageQueueApp) with a raw WebSocket
-// client speaking STOMP frames directly, as a sanity check beyond the mocked
-// unit tests: subscribe, receive an event, ack it, receive the next one.
+// WebSocket upgrade, real Server, real App) with a raw WebSocket client
+// speaking STOMP frames directly, as a sanity check beyond the mocked unit
+// tests: subscribe, receive an event, ack it, receive the next one.
 func TestSmokeEndToEnd(t *testing.T) {
 	listener := stomp.NewWSListener(stomp.SimpleAddr("test"))
 	mux := http.NewServeMux()
@@ -44,8 +46,8 @@ func TestSmokeEndToEnd(t *testing.T) {
 	go srv.Serve(listener)
 	defer listener.Close()
 
-	source := newTickerEventSource(100 * time.Millisecond)
-	newMessageQueueApp(srv, discardLogger(), source, newMemoryClientQueue)
+	source := eventsource.NewTickerSource(100 * time.Millisecond)
+	New(srv, discardLogger(), source, clientqueue.NewMemoryQueue)
 
 	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
 	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)

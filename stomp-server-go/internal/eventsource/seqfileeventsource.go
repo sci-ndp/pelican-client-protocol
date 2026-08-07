@@ -1,4 +1,4 @@
-package main
+package eventsource
 
 import (
 	"fmt"
@@ -9,12 +9,11 @@ import (
 	"time"
 )
 
-// seqFileEventSource is a demo EventSource like tickerEventSource, except its
-// sequence number survives process restarts: it's read from path on
-// construction and re-written to path after every increment, so a restarted
-// process resumes counting up from where it left off instead of starting
-// over at 1.
-type seqFileEventSource struct {
+// SeqFileSource is a demo EventSource like TickerSource, except its sequence
+// number survives process restarts: it's read from path on construction and
+// re-written to path after every increment, so a restarted process resumes
+// counting up from where it left off instead of starting over at 1.
+type SeqFileSource struct {
 	defaultNotifier
 	path string
 	log  *slog.Logger
@@ -22,25 +21,25 @@ type seqFileEventSource struct {
 	n    int
 }
 
-// newSeqFileEventSourceState reads the current sequence number from path (0
-// if the file doesn't exist yet or is empty) and returns a seqFileEventSource
-// ready to use, without starting its background ticker -- split out from
-// newSeqFileEventSource so tests can drive next() directly on a compressed,
+// newSeqFileSourceState reads the current sequence number from path (0 if
+// the file doesn't exist yet or is empty) and returns a SeqFileSource ready
+// to use, without starting its background ticker -- split out from
+// NewSeqFileSource so tests can drive next() directly on a compressed,
 // non-realtime schedule.
-func newSeqFileEventSourceState(path string, log *slog.Logger) (*seqFileEventSource, error) {
+func newSeqFileSourceState(path string, log *slog.Logger) (*SeqFileSource, error) {
 	n, err := readSeq(path)
 	if err != nil {
 		return nil, err
 	}
-	return &seqFileEventSource{path: path, log: log, ch: make(chan string, 1), n: n}, nil
+	return &SeqFileSource{path: path, log: log, ch: make(chan string, 1), n: n}, nil
 }
 
-// newSeqFileEventSource reads the current sequence number from path (0 if
-// the file doesn't exist yet or is empty) and starts emitting
+// NewSeqFileSource reads the current sequence number from path (0 if the
+// file doesn't exist yet or is empty) and starts emitting
 // "Persistent Event <n>" on interval counting up from n+1, persisting n back
 // to path after every increment.
-func newSeqFileEventSource(path string, interval time.Duration, log *slog.Logger) (*seqFileEventSource, error) {
-	s, err := newSeqFileEventSourceState(path, log)
+func NewSeqFileSource(path string, interval time.Duration, log *slog.Logger) (*SeqFileSource, error) {
+	s, err := newSeqFileSourceState(path, log)
 	if err != nil {
 		return nil, err
 	}
@@ -48,9 +47,9 @@ func newSeqFileEventSource(path string, interval time.Duration, log *slog.Logger
 	return s, nil
 }
 
-func (s *seqFileEventSource) Events() <-chan string { return s.ch }
+func (s *SeqFileSource) Events() <-chan string { return s.ch }
 
-func (s *seqFileEventSource) run(interval time.Duration) {
+func (s *SeqFileSource) run(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -60,7 +59,7 @@ func (s *seqFileEventSource) run(interval time.Duration) {
 
 // next increments the sequence number, persists it, and returns the event
 // string to emit.
-func (s *seqFileEventSource) next() string {
+func (s *SeqFileSource) next() string {
 	s.n++
 	// Persist before emitting: if the process dies between the two, a
 	// restart re-emits the same number it already wrote here, but never

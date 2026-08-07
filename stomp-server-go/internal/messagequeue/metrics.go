@@ -1,4 +1,4 @@
-package main
+package messagequeue
 
 import (
 	"net/http"
@@ -9,17 +9,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// liveQueueState is the read-only view into messageQueueApp's own
-// authoritative state that appMetrics needs so connectedClients,
-// activeQueues, and queuedEvents can be computed directly at scrape time
-// (via GaugeFunc) instead of kept in sync by hand at every call site that
-// touches queues/clientIDs. That hand-maintained approach is exactly what
-// produced this package's past gauge-drift bugs (queued_events oscillating
-// negative across restarts, then again after UNSUBSCRIBE deleted a queue
-// without correcting it) -- computing from the source of truth on every
-// scrape makes that whole class of bug structurally impossible. messageQueueApp
-// implements this interface; see its activeQueueCount/connectedClientCount/
-// queuedEventCount methods.
+// liveQueueState is the read-only view into App's own authoritative state
+// that appMetrics needs so connectedClients, activeQueues, and queuedEvents
+// can be computed directly at scrape time (via GaugeFunc) instead of kept in
+// sync by hand at every call site that touches queues/clientIDs. That
+// hand-maintained approach is exactly what produced this package's past
+// gauge-drift bugs (queued_events oscillating negative across restarts, then
+// again after UNSUBSCRIBE deleted a queue without correcting it) --
+// computing from the source of truth on every scrape makes that whole class
+// of bug structurally impossible. App implements this interface; see its
+// activeQueueCount/connectedClientCount/queuedEventCount methods.
 type liveQueueState interface {
 	activeQueueCount() int
 	connectedClientCount() int
@@ -28,11 +27,11 @@ type liveQueueState interface {
 
 // appMetrics is the messagequeue app's Prometheus instrumentation. This file
 // is the only place in the package that imports the prometheus client
-// library: messageQueueApp's own logic just calls these small,
-// semantically-named methods where something happens (a client subscribed,
-// an event was enqueued, ...) without knowing or caring that Prometheus is
-// what's counting it -- except for the three GaugeFuncs above, which instead
-// read messageQueueApp's own state directly through liveQueueState.
+// library: App's own logic just calls these small, semantically-named
+// methods where something happens (a client subscribed, an event was
+// enqueued, ...) without knowing or caring that Prometheus is what's
+// counting it -- except for the three GaugeFuncs above, which instead read
+// App's own state directly through liveQueueState.
 //
 // Each appMetrics owns its own registry rather than registering into the
 // global default one, so constructing more than one in the same process --
@@ -109,7 +108,7 @@ func newAppMetrics(state liveQueueState) *appMetrics {
 		}, []string{"reason"}),
 		queueErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "messagequeue_queue_errors_total",
-			Help: "clientQueue operation failures, by operation.",
+			Help: "clientqueue.Queue operation failures, by operation.",
 		}, []string{"operation"}),
 	}
 

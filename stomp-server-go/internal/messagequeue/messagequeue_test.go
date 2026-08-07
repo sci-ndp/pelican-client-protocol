@@ -1,4 +1,4 @@
-package main
+package messagequeue
 
 import (
 	"log/slog"
@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"stomp-server-go/internal/clientqueue"
 )
 
 func discardLogger() *slog.Logger {
@@ -126,8 +128,8 @@ func (f *fakeStompServer) snapshotSentErrors() []sentError {
 	return append([]sentError{}, f.sentErrors...)
 }
 
-// fakeEventSource is an EventSource test double whose channel a test can
-// feed directly, though most tests below call messageQueueApp's methods
+// fakeEventSource is an eventsource.EventSource test double whose channel a
+// test can feed directly, though most tests below call App's methods
 // directly instead, since that avoids any timing dependency on the app's
 // background run() goroutine. ShouldNotify defaults to always-true; a test
 // that needs to exercise per-client filtering sets shouldNotify directly.
@@ -136,9 +138,9 @@ func (f *fakeStompServer) snapshotSentErrors() []sentError {
 type fakeEventSource struct {
 	mu           sync.Mutex
 	ch           chan string
-	shouldNotify func(event string, q clientQueue) bool
-	added        []clientQueue
-	removed      []clientQueue
+	shouldNotify func(event string, q clientqueue.Queue) bool
+	added        []clientqueue.Queue
+	removed      []clientqueue.Queue
 }
 
 func newFakeEventSource() *fakeEventSource {
@@ -147,54 +149,54 @@ func newFakeEventSource() *fakeEventSource {
 
 func (f *fakeEventSource) Events() <-chan string { return f.ch }
 
-func (f *fakeEventSource) ShouldNotify(event string, q clientQueue) bool {
+func (f *fakeEventSource) ShouldNotify(event string, q clientqueue.Queue) bool {
 	if f.shouldNotify != nil {
 		return f.shouldNotify(event, q)
 	}
 	return true
 }
 
-func (f *fakeEventSource) QueueAdded(q clientQueue) {
+func (f *fakeEventSource) QueueAdded(q clientqueue.Queue) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.added = append(f.added, q)
 }
 
-func (f *fakeEventSource) QueueRemoved(q clientQueue) {
+func (f *fakeEventSource) QueueRemoved(q clientqueue.Queue) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = append(f.removed, q)
 }
 
-func (f *fakeEventSource) snapshotAdded() []clientQueue {
+func (f *fakeEventSource) snapshotAdded() []clientqueue.Queue {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]clientQueue{}, f.added...)
+	return append([]clientqueue.Queue{}, f.added...)
 }
 
-func (f *fakeEventSource) snapshotRemoved() []clientQueue {
+func (f *fakeEventSource) snapshotRemoved() []clientqueue.Queue {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]clientQueue{}, f.removed...)
+	return append([]clientqueue.Queue{}, f.removed...)
 }
 
-func newTestApp(cfg messageQueueConfig) (*messageQueueApp, *fakeStompServer) {
+func newTestApp(cfg Config) (*App, *fakeStompServer) {
 	srv := newFakeStompServer()
 	source := newFakeEventSource()
-	app := newMessageQueueAppWithConfig(srv, discardLogger(), source, cfg, newMemoryClientQueue)
+	app := NewWithConfig(srv, discardLogger(), source, cfg, clientqueue.NewMemoryQueue)
 	return app, srv
 }
 
-// queueEvents reads out a memoryClientQueue's contents for assertions. All
-// tests in this file use newMemoryClientQueue as their queueFactory, so this
-// type assertion is safe.
-func queueEvents(t *testing.T, q clientQueue) []string {
+// queueEvents reads out a clientqueue.MemoryQueue's contents for assertions.
+// All tests in this file use clientqueue.NewMemoryQueue as their factory, so
+// this type assertion is safe.
+func queueEvents(t *testing.T, q clientqueue.Queue) []string {
 	t.Helper()
-	mq, ok := q.(*memoryClientQueue)
+	mq, ok := q.(*clientqueue.MemoryQueue)
 	if !ok {
-		t.Fatalf("expected a *memoryClientQueue, got %T", q)
+		t.Fatalf("expected a *clientqueue.MemoryQueue, got %T", q)
 	}
-	return append([]string{}, mq.events...)
+	return mq.Snapshot()
 }
 
 func subscribeHeaders(clientID string) map[string]string {
@@ -206,7 +208,7 @@ func subscribeHeaders(clientID string) map[string]string {
 }
 
 func TestOnEvent_DropsWhenNoQueuesRegistered(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 
 	app.onEvent("Event 1")
 
@@ -216,7 +218,7 @@ func TestOnEvent_DropsWhenNoQueuesRegistered(t *testing.T) {
 }
 
 func TestOnEvent_SkipsClientsShouldNotifyRejects(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	srv.setConnected("bob/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -230,7 +232,7 @@ func TestOnEvent_SkipsClientsShouldNotifyRejects(t *testing.T) {
 	// itself -- compare against the queue captured above instead of looking
 	// it up again.
 	source := app.source.(*fakeEventSource)
-	source.shouldNotify = func(event string, q clientQueue) bool { return q != bobQueue }
+	source.shouldNotify = func(event string, q clientqueue.Queue) bool { return q != bobQueue }
 
 	app.onEvent("Event 1")
 
@@ -247,12 +249,12 @@ func TestOnEvent_SkipsClientsShouldNotifyRejects(t *testing.T) {
 }
 
 func TestOnEvent_ShouldNotifyRejectingEveryoneIsNotCountedAsDropped(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
 
 	source := app.source.(*fakeEventSource)
-	source.shouldNotify = func(event string, q clientQueue) bool { return false }
+	source.shouldNotify = func(event string, q clientqueue.Queue) bool { return false }
 
 	app.onEvent("Event 1")
 
@@ -265,7 +267,7 @@ func TestOnEvent_ShouldNotifyRejectingEveryoneIsNotCountedAsDropped(t *testing.T
 }
 
 func TestOnSubscribe_CreatesQueueAndDeliversOnceConnected(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -287,7 +289,7 @@ func TestOnSubscribe_CreatesQueueAndDeliversOnceConnected(t *testing.T) {
 }
 
 func TestOnSubscribe_IncrementsConnectedClientsGauge(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	srv.setConnected("bob/testsource", true)
 
@@ -307,7 +309,7 @@ func TestOnSubscribe_IncrementsConnectedClientsGauge(t *testing.T) {
 }
 
 func TestOnDisconnect_DecrementsConnectedClientsGauge(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
@@ -322,7 +324,7 @@ func TestOnDisconnect_DecrementsConnectedClientsGauge(t *testing.T) {
 }
 
 func TestOnDisconnect_IgnoresUnknownDestination(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
 
@@ -334,7 +336,7 @@ func TestOnDisconnect_IgnoresUnknownDestination(t *testing.T) {
 }
 
 func TestOnDisconnect_ReconnectAfterDisconnectIncrementsAgain(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -352,7 +354,7 @@ func TestOnDisconnect_ReconnectAfterDisconnectIncrementsAgain(t *testing.T) {
 }
 
 func TestOnUnsubscribe_DeletesQueueAndBookkeeping(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -395,7 +397,7 @@ func TestOnUnsubscribe_DeletesQueueAndBookkeeping(t *testing.T) {
 }
 
 func TestOnUnsubscribe_DecrementsActiveQueuesGauge(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -411,7 +413,7 @@ func TestOnUnsubscribe_DecrementsActiveQueuesGauge(t *testing.T) {
 }
 
 func TestOnUnsubscribe_CorrectsQueuedEventsForEventsNeverDelivered(t *testing.T) {
-	app, _ := newTestApp(defaultMessageQueueConfig)
+	app, _ := newTestApp(defaultConfig)
 	// Deliberately offline: onEvent enqueues but never delivers, so the
 	// queue still holds the event when it's deleted below.
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -432,7 +434,7 @@ func TestOnUnsubscribe_CorrectsQueuedEventsForEventsNeverDelivered(t *testing.T)
 }
 
 func TestOnUnsubscribe_IgnoresUnknownDestination(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
 
@@ -450,7 +452,7 @@ func TestOnUnsubscribe_IgnoresUnknownDestination(t *testing.T) {
 }
 
 func TestOnUnsubscribe_DoesNotAffectConnectedClientsGauge(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
 
@@ -465,7 +467,7 @@ func TestOnUnsubscribe_DoesNotAffectConnectedClientsGauge(t *testing.T) {
 }
 
 func TestOnDisconnect_DecrementsGaugeEvenAfterPriorUnsubscribe(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
 
@@ -487,7 +489,7 @@ func TestOnDisconnect_DecrementsGaugeEvenAfterPriorUnsubscribe(t *testing.T) {
 }
 
 func TestOnUnsubscribe_ThenResubscribeStartsWithAFreshEmptyQueue(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -504,7 +506,7 @@ func TestOnUnsubscribe_ThenResubscribeStartsWithAFreshEmptyQueue(t *testing.T) {
 }
 
 func TestOnAck_AdvancesQueueAndDeliversNext(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -531,7 +533,7 @@ func TestOnAck_AdvancesQueueAndDeliversNext(t *testing.T) {
 }
 
 func TestOnSubscribe_ResumesExistingQueueAcrossReconnect(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	headers := subscribeHeaders("bob")
 
 	srv.setConnected("bob/testsource", true)
@@ -569,7 +571,7 @@ func TestOnSubscribe_ResumesExistingQueueAcrossReconnect(t *testing.T) {
 }
 
 func TestOnSubscribe_DeliversToWhateverDestinationClientSubscribedTo(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	// An arbitrary suffix -- not the old single <event-source-name> segment --
 	// but still owned by "alice", satisfying the first-segment-must-match rule.
 	const destination = "alice/totally/unrelated/nested/path"
@@ -600,7 +602,7 @@ func TestOnSubscribe_DeliversToWhateverDestinationClientSubscribedTo(t *testing.
 }
 
 func TestOnSubscribe_UpdatesDestinationWhenClientResubscribesElsewhere(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	const oldDestination = "alice/old-destination"
 	const newDestination = "alice/new-destination"
 	srv.setConnected(oldDestination, true)
@@ -679,13 +681,13 @@ func TestSubscriptionParams(t *testing.T) {
 }
 
 func TestOnSubscribe_PassesSubscriptionParamsToQueueFactory(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/topic=weather&qos=1", true)
 
 	var gotClientID, gotParams string
-	app.newQueue = func(clientID, params string) clientQueue {
+	app.newQueue = func(clientID, params string) clientqueue.Queue {
 		gotClientID, gotParams = clientID, params
-		return newMemoryClientQueue(clientID, params)
+		return clientqueue.NewMemoryQueue(clientID, params)
 	}
 
 	app.onSubscribe(map[string]string{
@@ -709,13 +711,13 @@ func TestOnSubscribe_ResubscribeDoesNotRecreateQueueOrReinvokeFactory(t *testing
 	// factory again. Documenting this existing, unchanged behavior here
 	// since it's now directly relevant to whether new params ever reach an
 	// existing queue (they don't, today).
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/first", true)
 
 	calls := 0
-	app.newQueue = func(clientID, params string) clientQueue {
+	app.newQueue = func(clientID, params string) clientqueue.Queue {
 		calls++
-		return newMemoryClientQueue(clientID, params)
+		return clientqueue.NewMemoryQueue(clientID, params)
 	}
 
 	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/first", "ack": "client-individual"})
@@ -728,7 +730,7 @@ func TestOnSubscribe_ResubscribeDoesNotRecreateQueueOrReinvokeFactory(t *testing
 }
 
 func TestOnSubscribe_CallsQueueAddedOnceForNewQueue(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/first", true)
 	srv.setConnected("alice/second", true)
 	source := app.source.(*fakeEventSource)
@@ -749,12 +751,12 @@ func TestOnSubscribe_CallsQueueAddedOnceForNewQueue(t *testing.T) {
 }
 
 func TestRehydrateQueues_PopulatesQueuesAndCallsQueueAdded(t *testing.T) {
-	app, _ := newTestApp(defaultMessageQueueConfig)
+	app, _ := newTestApp(defaultConfig)
 	source := app.source.(*fakeEventSource)
 
-	app.RehydrateQueues([]persistedClient{
-		{clientID: "alice", params: "osdf/vdc/public/pelican_protocol"},
-		{clientID: "bob", params: "osdf/vdc/public/other"},
+	app.RehydrateQueues([]clientqueue.PersistedClient{
+		{ClientID: "alice", Params: "osdf/vdc/public/pelican_protocol"},
+		{ClientID: "bob", Params: "osdf/vdc/public/other"},
 	})
 
 	app.mu.Lock()
@@ -778,7 +780,7 @@ func TestRehydrateQueues_PopulatesQueuesAndCallsQueueAdded(t *testing.T) {
 }
 
 func TestRehydrateQueues_SkipsClientIDsAlreadyPresent(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
 
@@ -787,7 +789,7 @@ func TestRehydrateQueues_SkipsClientIDsAlreadyPresent(t *testing.T) {
 	originalQueue := app.queues["alice"]
 	app.mu.Unlock()
 
-	app.RehydrateQueues([]persistedClient{{clientID: "alice", params: "should-be-ignored"}})
+	app.RehydrateQueues([]clientqueue.PersistedClient{{ClientID: "alice", Params: "should-be-ignored"}})
 
 	app.mu.Lock()
 	currentQueue := app.queues["alice"]
@@ -801,9 +803,9 @@ func TestRehydrateQueues_SkipsClientIDsAlreadyPresent(t *testing.T) {
 }
 
 func TestRehydrateQueues_DoesNotMarkClientAsConnected(t *testing.T) {
-	app, _ := newTestApp(defaultMessageQueueConfig)
+	app, _ := newTestApp(defaultConfig)
 
-	app.RehydrateQueues([]persistedClient{{clientID: "alice", params: "osdf/vdc/public/pelican_protocol"}})
+	app.RehydrateQueues([]clientqueue.PersistedClient{{ClientID: "alice", Params: "osdf/vdc/public/pelican_protocol"}})
 
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
 		t.Errorf("connectedClients after RehydrateQueues = %v, want 0 -- a rehydrated queue has no live connection yet", got)
@@ -817,9 +819,9 @@ func TestRehydrateQueues_DoesNotMarkClientAsConnected(t *testing.T) {
 }
 
 func TestRehydrateQueues_BacklogIsDeliveredOnceTheRealClientSubscribes(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 
-	app.RehydrateQueues([]persistedClient{{clientID: "alice", params: "testsource"}})
+	app.RehydrateQueues([]clientqueue.PersistedClient{{ClientID: "alice", Params: "testsource"}})
 	app.onEvent("Event 1") // enqueued into the rehydrated queue, but not deliverable yet
 
 	if got := srv.snapshotPublishes(); len(got) != 0 {
@@ -839,7 +841,7 @@ func TestRehydrateQueues_BacklogIsDeliveredOnceTheRealClientSubscribes(t *testin
 }
 
 func TestOnUnsubscribe_CallsQueueRemoved(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
 
@@ -857,7 +859,7 @@ func TestOnUnsubscribe_CallsQueueRemoved(t *testing.T) {
 }
 
 func TestOnUnsubscribe_UnknownDestinationDoesNotCallQueueRemoved(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -870,7 +872,7 @@ func TestOnUnsubscribe_UnknownDestinationDoesNotCallQueueRemoved(t *testing.T) {
 }
 
 func TestOnSubscribe_RejectsDestinationNotOwnedByClient(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("bob/something", true)
 
 	app.onSubscribe(map[string]string{
@@ -892,7 +894,7 @@ func TestOnSubscribe_RejectsDestinationNotOwnedByClient(t *testing.T) {
 }
 
 func TestOnSubscribe_RejectsDestinationWithMatchingPrefixButDifferentSegment(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("aliceX/foo", true)
 
 	app.onSubscribe(map[string]string{
@@ -908,8 +910,8 @@ func TestOnSubscribe_RejectsDestinationWithMatchingPrefixButDifferentSegment(t *
 }
 
 func TestOnEvent_DisconnectsConnectedClientOnOverflow(t *testing.T) {
-	cfg := defaultMessageQueueConfig
-	cfg.maxQueueLen = 3
+	cfg := defaultConfig
+	cfg.MaxQueueLen = 3
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
 
@@ -947,8 +949,8 @@ func TestOnEvent_DisconnectsConnectedClientOnOverflow(t *testing.T) {
 }
 
 func TestOnEvent_TrimsWithoutDisconnectingWhenOffline(t *testing.T) {
-	cfg := defaultMessageQueueConfig
-	cfg.maxQueueLen = 3
+	cfg := defaultConfig
+	cfg.MaxQueueLen = 3
 	app, srv := newTestApp(cfg)
 
 	// The client subscribed once (so the queue exists) but is now offline;
@@ -989,11 +991,11 @@ func TestOnEvent_TrimsWithoutDisconnectingWhenOffline(t *testing.T) {
 }
 
 func TestOnRetryTimeout_BacksOffThenGivesUpAndDisconnects(t *testing.T) {
-	cfg := messageQueueConfig{
-		initialRetryDelay:  time.Millisecond,
-		retryBackoffFactor: 1.2,
-		maxRetries:         3,
-		maxQueueLen:        defaultMessageQueueConfig.maxQueueLen,
+	cfg := Config{
+		InitialRetryDelay:  time.Millisecond,
+		RetryBackoffFactor: 1.2,
+		MaxRetries:         3,
+		MaxQueueLen:        defaultConfig.MaxQueueLen,
 	}
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
@@ -1018,8 +1020,8 @@ func TestOnRetryTimeout_BacksOffThenGivesUpAndDisconnects(t *testing.T) {
 	}
 
 	publishes := srv.snapshotPublishes()
-	if len(publishes) != 1+cfg.maxRetries {
-		t.Fatalf("publishes = %d, want %d (1 initial send + %d retries)", len(publishes), 1+cfg.maxRetries, cfg.maxRetries)
+	if len(publishes) != 1+cfg.MaxRetries {
+		t.Fatalf("publishes = %d, want %d (1 initial send + %d retries)", len(publishes), 1+cfg.MaxRetries, cfg.MaxRetries)
 	}
 	for _, p := range publishes {
 		if p.body != "Event 1" {
@@ -1036,7 +1038,7 @@ func TestOnRetryTimeout_BacksOffThenGivesUpAndDisconnects(t *testing.T) {
 }
 
 func TestOnAck_IgnoresMismatchedOrUnknownAck(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -1068,16 +1070,16 @@ func TestOnAck_IgnoresMismatchedOrUnknownAck(t *testing.T) {
 	}
 }
 
-func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
+func TestApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "queue.sqlite3")
 
-	db1, err := openQueueDB(dbPath)
+	db1, err := clientqueue.OpenDB(dbPath)
 	if err != nil {
-		t.Fatalf("openQueueDB: %v", err)
+		t.Fatalf("OpenDB: %v", err)
 	}
 	srv1 := newFakeStompServer()
 	srv1.setConnected("carol/testsource", true)
-	app1 := newMessageQueueAppWithConfig(srv1, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db1, discardLogger()))
+	app1 := NewWithConfig(srv1, discardLogger(), newFakeEventSource(), defaultConfig, clientqueue.SQLiteFactory(db1, discardLogger()))
 	app1.onSubscribe(subscribeHeaders("carol"))
 	app1.onEvent("Event 1") // delivered but never acked
 	if got := srv1.snapshotPublishes(); len(got) != 1 {
@@ -1089,14 +1091,14 @@ func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 
 	// Simulate a full process restart: a brand-new app and server, backed by
 	// the same on-disk database file.
-	db2, err := openQueueDB(dbPath)
+	db2, err := clientqueue.OpenDB(dbPath)
 	if err != nil {
-		t.Fatalf("reopen openQueueDB: %v", err)
+		t.Fatalf("reopen OpenDB: %v", err)
 	}
 	t.Cleanup(func() { db2.Close() })
 	srv2 := newFakeStompServer()
 	srv2.setConnected("carol/testsource", true)
-	app2 := newMessageQueueAppWithConfig(srv2, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db2, discardLogger()))
+	app2 := NewWithConfig(srv2, discardLogger(), newFakeEventSource(), defaultConfig, clientqueue.SQLiteFactory(db2, discardLogger()))
 	app2.onSubscribe(subscribeHeaders("carol"))
 
 	publishes := srv2.snapshotPublishes()
@@ -1122,14 +1124,14 @@ func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 
 func TestOnSubscribe_ReconnectWithoutRestartDoesNotDoubleCountGauge(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "queue.sqlite3")
-	db, err := openQueueDB(dbPath)
+	db, err := clientqueue.OpenDB(dbPath)
 	if err != nil {
-		t.Fatalf("openQueueDB: %v", err)
+		t.Fatalf("OpenDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	app, srv := newTestApp(defaultMessageQueueConfig)
-	app.newQueue = sqliteQueueFactory(db, discardLogger())
+	app, srv := newTestApp(defaultConfig)
+	app.newQueue = clientqueue.SQLiteFactory(db, discardLogger())
 	srv.setConnected("dave/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("dave"))

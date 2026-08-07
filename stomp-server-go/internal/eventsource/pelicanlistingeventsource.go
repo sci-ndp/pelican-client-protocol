@@ -1,4 +1,4 @@
-package main
+package eventsource
 
 import (
 	"bytes"
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"stomp-server-go/internal/clientqueue"
 )
 
 // pelicanListTimeout bounds a single poll's invocation of the pelican
@@ -69,8 +71,8 @@ func execPelicanListing(pelicanBinary string) pelicanListingRunner {
 	}
 }
 
-// pelicanDirectoryFromParams parses a client's subscription parameters (see
-// subscriptionParams) of the form "<protocol>/<object path>" -- e.g.
+// pelicanDirectoryFromParams parses a client's subscription parameters of
+// the form "<protocol>/<object path>" -- e.g.
 // "osdf/vdc/public/pelican_protocol" -- into a Pelican federation directory
 // URL, e.g. "osdf://vdc/public/pelican_protocol". ok is false if params
 // doesn't contain a "/" with a non-empty protocol and path on either side,
@@ -98,9 +100,9 @@ func pelicanURLDir(u string) string {
 	return scheme + "://" + path.Dir(rest)
 }
 
-// pelicanListingEventSource dynamically discovers which Pelican federation
+// PelicanListingSource dynamically discovers which Pelican federation
 // directories to watch from the subscription parameters of every currently
-// active client queue (see clientQueue.Params, pelicanDirectoryFromParams),
+// active client queue (see clientqueue.Queue.Params, pelicanDirectoryFromParams),
 // rather than a single directory fixed at construction. It polls the union
 // of those directories on a fixed interval via the pelican CLI, diffs each
 // directory's files against what was last observed there, and emits one
@@ -109,9 +111,8 @@ func pelicanURLDir(u string) string {
 // events for its own directory, never another client's.
 //
 // A client queue becomes tracked (and its directory starts being watched)
-// via QueueAdded, and stops via QueueRemoved -- see messageQueueApp's
-// onSubscribe/onUnsubscribe. A queue whose Params don't parse as
-// "<protocol>/<path>" contributes no directory.
+// via QueueAdded, and stops via QueueRemoved. A queue whose Params don't
+// parse as "<protocol>/<path>" contributes no directory.
 //
 // This only looks at the one directory named by each client's params:
 // entries with IsCollection true are subdirectories and are skipped, not
@@ -123,44 +124,44 @@ func pelicanURLDir(u string) string {
 // otherwise a client subscribing to an already-established directory would
 // be flooded with one event per pre-existing file. "New" specifically means
 // "appeared since the last poll of this directory", not "exists".
-type pelicanListingEventSource struct {
+type PelicanListingSource struct {
 	statePath string
 	list      pelicanListingRunner
 	log       *slog.Logger
 	ch        chan string
 
 	mu      sync.Mutex
-	tracked map[clientQueue]bool       // currently active client queues
+	tracked map[clientqueue.Queue]bool // currently active client queues
 	seen    map[string]map[string]bool // directory URL -> observed file names; a directory's key exists once its baseline has been seeded
 }
 
-// newPelicanListingEventSourceState loads statePath's previously-observed
+// newPelicanListingSourceState loads statePath's previously-observed
 // per-directory file sets (empty if the file doesn't exist yet) and returns
-// a pelicanListingEventSource ready to use, without starting its background
-// poll loop -- split out from newPelicanListingEventSource so tests can call
-// poll() directly with a fake pelicanListingRunner on a compressed,
-// non-realtime schedule.
-func newPelicanListingEventSourceState(statePath string, list pelicanListingRunner, log *slog.Logger) (*pelicanListingEventSource, error) {
+// a PelicanListingSource ready to use, without starting its background poll
+// loop -- split out from NewPelicanListingSource so tests can call poll()
+// directly with a fake pelicanListingRunner on a compressed, non-realtime
+// schedule.
+func newPelicanListingSourceState(statePath string, list pelicanListingRunner, log *slog.Logger) (*PelicanListingSource, error) {
 	seen, err := readDirectorySets(statePath)
 	if err != nil {
 		return nil, err
 	}
-	return &pelicanListingEventSource{
+	return &PelicanListingSource{
 		statePath: statePath,
 		list:      list,
 		log:       log,
 		ch:        make(chan string, 1),
-		tracked:   map[clientQueue]bool{},
+		tracked:   map[clientqueue.Queue]bool{},
 		seen:      seen,
 	}, nil
 }
 
-// newPelicanListingEventSource loads statePath's previously-observed
+// NewPelicanListingSource loads statePath's previously-observed
 // per-directory file sets and starts polling the union of watched
 // directories every interval via pelicanBinary's "object ls", persisting
 // the observed sets back to statePath after every poll.
-func newPelicanListingEventSource(interval time.Duration, statePath, pelicanBinary string, log *slog.Logger) (*pelicanListingEventSource, error) {
-	s, err := newPelicanListingEventSourceState(statePath, execPelicanListing(pelicanBinary), log)
+func NewPelicanListingSource(interval time.Duration, statePath, pelicanBinary string, log *slog.Logger) (*PelicanListingSource, error) {
+	s, err := newPelicanListingSourceState(statePath, execPelicanListing(pelicanBinary), log)
 	if err != nil {
 		return nil, err
 	}
@@ -168,9 +169,9 @@ func newPelicanListingEventSource(interval time.Duration, statePath, pelicanBina
 	return s, nil
 }
 
-func (s *pelicanListingEventSource) Events() <-chan string { return s.ch }
+func (s *PelicanListingSource) Events() <-chan string { return s.ch }
 
-func (s *pelicanListingEventSource) run(interval time.Duration) {
+func (s *PelicanListingSource) run(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -179,7 +180,7 @@ func (s *pelicanListingEventSource) run(interval time.Duration) {
 }
 
 // QueueAdded implements EventSource.
-func (s *pelicanListingEventSource) QueueAdded(q clientQueue) {
+func (s *PelicanListingSource) QueueAdded(q clientqueue.Queue) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tracked[q] = true
@@ -188,7 +189,7 @@ func (s *pelicanListingEventSource) QueueAdded(q clientQueue) {
 // QueueRemoved implements EventSource. The directory q named (if any) stops
 // being polled once no other tracked queue still names it; its "seen" state
 // simply lingers, unpolled, rather than being cleaned up.
-func (s *pelicanListingEventSource) QueueRemoved(q clientQueue) {
+func (s *PelicanListingSource) QueueRemoved(q clientqueue.Queue) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.tracked, q)
@@ -197,7 +198,7 @@ func (s *pelicanListingEventSource) QueueRemoved(q clientQueue) {
 // ShouldNotify implements EventSource: a client only ever sees new-file
 // events for the one Pelican directory named by its own subscription
 // parameters, never another client's directory.
-func (s *pelicanListingEventSource) ShouldNotify(event string, q clientQueue) bool {
+func (s *PelicanListingSource) ShouldNotify(event string, q clientqueue.Queue) bool {
 	dir, ok := pelicanDirectoryFromParams(q.Params())
 	if !ok {
 		return false
@@ -211,7 +212,7 @@ func (s *pelicanListingEventSource) ShouldNotify(event string, q clientQueue) bo
 
 // watchedDirectories returns the current union of Pelican directories named
 // by every tracked client queue's subscription parameters.
-func (s *pelicanListingEventSource) watchedDirectories() []string {
+func (s *PelicanListingSource) watchedDirectories() []string {
 	s.mu.Lock()
 	dirSet := map[string]bool{}
 	for q := range s.tracked {
@@ -232,7 +233,7 @@ func (s *pelicanListingEventSource) watchedDirectories() []string {
 // poll lists every currently-watched directory and processes each
 // independently, so one directory's listing failure can't prevent the
 // others from being checked.
-func (s *pelicanListingEventSource) poll() {
+func (s *PelicanListingSource) poll() {
 	for _, dir := range s.watchedDirectories() {
 		s.pollDirectory(dir)
 	}
@@ -243,7 +244,7 @@ func (s *pelicanListingEventSource) poll() {
 // unexpected-empty-result, or persist) is logged and leaves this
 // directory's seen set unmodified, so the next poll retries the diff fresh
 // rather than forgetting or double-reporting history.
-func (s *pelicanListingEventSource) pollDirectory(dir string) {
+func (s *PelicanListingSource) pollDirectory(dir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), pelicanListTimeout)
 	defer cancel()
 	objects, err := s.list(ctx, dir)
@@ -330,7 +331,7 @@ func (s *pelicanListingEventSource) pollDirectory(dir string) {
 // statePath as JSON (directory URL -> sorted file names), so a restarted
 // process resumes each directory from where it left off instead of
 // re-announcing every file already there as new.
-func (s *pelicanListingEventSource) persist() error {
+func (s *PelicanListingSource) persist() error {
 	s.mu.Lock()
 	snapshot := make(map[string][]string, len(s.seen))
 	for dir, names := range s.seen {

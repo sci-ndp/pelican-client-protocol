@@ -1,4 +1,4 @@
-package main
+package messagequeue
 
 import (
 	"errors"
@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"stomp-server-go/internal/clientqueue"
 )
 
 func TestMetrics_SubscribeAcceptedAndRejected(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 
 	app.onSubscribe(subscribeHeaders("alice"))                                                                        // accepted
 	app.onSubscribe(map[string]string{"subscription": "", "destination": "", "ack": "client-individual"})             // missing headers
@@ -35,7 +37,7 @@ func TestMetrics_SubscribeAcceptedAndRejected(t *testing.T) {
 }
 
 func TestMetrics_QueueLifecycleCountersAndGauges(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice"))
@@ -74,7 +76,7 @@ func TestMetrics_QueueLifecycleCountersAndGauges(t *testing.T) {
 }
 
 func TestMetrics_EventDroppedWhenNoQueuesRegistered(t *testing.T) {
-	app, _ := newTestApp(defaultMessageQueueConfig)
+	app, _ := newTestApp(defaultConfig)
 
 	app.onEvent("Event 1")
 
@@ -87,8 +89,8 @@ func TestMetrics_EventDroppedWhenNoQueuesRegistered(t *testing.T) {
 }
 
 func TestMetrics_QueueOverflowWhileConnectedRecordsOverflowAndDisconnect(t *testing.T) {
-	cfg := defaultMessageQueueConfig
-	cfg.maxQueueLen = 3
+	cfg := defaultConfig
+	cfg.MaxQueueLen = 3
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
 
@@ -106,8 +108,8 @@ func TestMetrics_QueueOverflowWhileConnectedRecordsOverflowAndDisconnect(t *test
 }
 
 func TestMetrics_QueueOverflowWhileOfflineDoesNotDisconnect(t *testing.T) {
-	cfg := defaultMessageQueueConfig
-	cfg.maxQueueLen = 3
+	cfg := defaultConfig
+	cfg.MaxQueueLen = 3
 	app, srv := newTestApp(cfg)
 
 	srv.setConnected("alice/testsource", true)
@@ -127,11 +129,11 @@ func TestMetrics_QueueOverflowWhileOfflineDoesNotDisconnect(t *testing.T) {
 }
 
 func TestMetrics_RetryExhaustionRecordsRetriesAndDisconnect(t *testing.T) {
-	cfg := messageQueueConfig{
-		initialRetryDelay:  time.Millisecond,
-		retryBackoffFactor: 1.2,
-		maxRetries:         3,
-		maxQueueLen:        defaultMessageQueueConfig.maxQueueLen,
+	cfg := Config{
+		InitialRetryDelay:  time.Millisecond,
+		RetryBackoffFactor: 1.2,
+		MaxRetries:         3,
+		MaxQueueLen:        defaultConfig.MaxQueueLen,
 	}
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
@@ -150,16 +152,16 @@ func TestMetrics_RetryExhaustionRecordsRetriesAndDisconnect(t *testing.T) {
 	if got := testutil.ToFloat64(app.metrics.clientDisconnects.WithLabelValues("retry_exhausted")); got != 1 {
 		t.Errorf(`clientDisconnects{reason="retry_exhausted"} = %v, want 1`, got)
 	}
-	if got := testutil.ToFloat64(app.metrics.retries); got != float64(cfg.maxRetries) {
-		t.Errorf("retries = %v, want %d", got, cfg.maxRetries)
+	if got := testutil.ToFloat64(app.metrics.retries); got != float64(cfg.MaxRetries) {
+		t.Errorf("retries = %v, want %d", got, cfg.MaxRetries)
 	}
-	if got := testutil.ToFloat64(app.metrics.messagesPublished); got != float64(1+cfg.maxRetries) {
-		t.Errorf("messagesPublished = %v, want %d (1 initial send + %d retries)", got, 1+cfg.maxRetries, cfg.maxRetries)
+	if got := testutil.ToFloat64(app.metrics.messagesPublished); got != float64(1+cfg.MaxRetries) {
+		t.Errorf("messagesPublished = %v, want %d (1 initial send + %d retries)", got, 1+cfg.MaxRetries, cfg.MaxRetries)
 	}
 }
 
-// brokenClientQueue is a clientQueue whose every operation fails, used to
-// verify queue-operation failures are all reflected in queueErrorOccurred.
+// brokenClientQueue is a clientqueue.Queue whose every operation fails, used
+// to verify queue-operation failures are all reflected in queueErrorOccurred.
 type brokenClientQueue struct{}
 
 func (brokenClientQueue) Enqueue(string, int) (bool, error) { return false, errors.New("boom") }
@@ -170,8 +172,8 @@ func (brokenClientQueue) Delete() error                     { return errors.New(
 func (brokenClientQueue) Params() string                    { return "" }
 
 func TestMetrics_QueueErrorsRecordedByOperation(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
-	app.newQueue = func(string, string) clientQueue { return brokenClientQueue{} }
+	app, srv := newTestApp(defaultConfig)
+	app.newQueue = func(string, string) clientqueue.Queue { return brokenClientQueue{} }
 	srv.setConnected("alice/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("alice")) // Len() fails during onSubscribe's resume check
@@ -186,7 +188,7 @@ func TestMetrics_QueueErrorsRecordedByOperation(t *testing.T) {
 }
 
 func TestMetrics_HandlerServesPrometheusExpositionFormat(t *testing.T) {
-	app, srv := newTestApp(defaultMessageQueueConfig)
+	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	app.onSubscribe(subscribeHeaders("alice"))
 	app.onEvent("Event 1")
