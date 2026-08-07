@@ -305,15 +305,25 @@ func subscriptionParams(destination string) string {
 
 // onSubscribe creates a new event queue the first time a client's
 // `subscription` header is seen, or resumes the existing one if it matches a
-// queue kept around from an earlier connection. Either way, any leftover
-// retry state is cleared so this connection's retry loop starts fresh, and
-// the client's destination is (re)recorded as wherever this SUBSCRIBE named
-// -- future deliveries for this client always go back there, regardless of
-// what it was on a previous connection. The destination's first path segment
-// must be the client's own subscription id; everything after that is this
-// client's subscription parameters (see subscriptionParams), so one client
-// can never subscribe to a destination namespaced under a different
-// client's id.
+// queue kept around from an earlier connection made with the same
+// subscription parameters. A client that reconnects with DIFFERENT
+// subscription parameters than its existing queue was created with -- e.g.
+// it never sent UNSUBSCRIBE before dropping off and coming back with a new
+// destination -- is treated exactly as if it had explicitly unsubscribed
+// first: the old queue is discarded (see the QueueRemoved/Delete call
+// below, mirroring onUnsubscribe) and a brand-new one is created for the new
+// parameters. Without this, a durable queue would otherwise silently keep
+// serving (or, for something like the Pelican listing source, keep having
+// watched) whatever the client's PREVIOUS parameters named, since nothing
+// else would ever have told it those parameters no longer apply. Either way,
+// any leftover retry state is cleared so this connection's retry loop starts
+// fresh, and the client's destination is (re)recorded as wherever this
+// SUBSCRIBE named -- future deliveries for this client always go back there,
+// regardless of what it was on a previous connection. The destination's
+// first path segment must be the client's own subscription id; everything
+// after that is this client's subscription parameters (see
+// subscriptionParams), so one client can never subscribe to a destination
+// namespaced under a different client's id.
 func (a *App) onSubscribe(headers map[string]string) {
 	clientID := headers["subscription"]
 	destination := headers["destination"]
@@ -333,6 +343,7 @@ func (a *App) onSubscribe(headers map[string]string) {
 			"subscription", clientID, "ack", ack)
 	}
 	a.metrics.subscribeAccepted()
+	params := subscriptionParams(destination)
 
 	a.mu.Lock()
 	if old, ok := a.destinations[clientID]; ok && old != destination {
@@ -342,27 +353,51 @@ func (a *App) onSubscribe(headers map[string]string) {
 	a.clientIDs[destination] = clientID
 
 	q, existed := a.queues[clientID]
-	if !existed {
-		q = a.newQueue(clientID, subscriptionParams(destination))
-		a.queues[clientID] = q
-		a.source.QueueAdded(q)
+	var discarded clientqueue.Queue
+	if existed && q.Params() != params {
+		discarded = q
+		delete(a.queues, clientID)
+		existed = false
 	}
 	a.clearInFlight(clientID)
 	a.mu.Unlock()
 
-	// existed only tracks whether this process has already built an
-	// in-process handle for clientID; a durable queue (e.g. the SQLite one)
-	// may have events from a prior process run before this one ever saw
-	// clientID, so ask the queue itself whether there's anything to resume,
-	// purely for this log line -- queuedEvents itself reads straight from the
-	// queue at scrape time, so there's nothing to seed here.
+	// The discarded queue's durable rows (if any) must be gone before the
+	// replacement queue below is created and registered: a SQLite-backed
+	// queue is keyed only by client id, not by params, so if this ran the
+	// other way around the new queue would immediately see the old
+	// parameters' leftover rows under its own client id.
+	if discarded != nil {
+		a.source.QueueRemoved(discarded)
+		if err := discarded.Delete(); err != nil {
+			a.log.Error("stale queue delete failed", "subscription", clientID, "error", err)
+			a.metrics.queueErrorOccurred("delete")
+		}
+		a.log.Info("client resubscribed with different parameters; old queue discarded",
+			"subscription", clientID, "destination", destination)
+	}
+
+	a.mu.Lock()
+	if !existed {
+		q = a.newQueue(clientID, params)
+		a.queues[clientID] = q
+		a.source.QueueAdded(q)
+	}
+	a.mu.Unlock()
+
+	// existed only tracks whether this process currently has an in-process
+	// handle for clientID's current parameters; a durable queue (e.g. the
+	// SQLite one) may have events from a prior process run before this one
+	// ever saw clientID, so ask the queue itself whether there's anything to
+	// resume, purely for this log line -- queuedEvents itself reads straight
+	// from the queue at scrape time, so there's nothing to seed here.
 	if n, err := q.Len(); err != nil {
 		a.log.Warn("queue length check failed", "subscription", clientID, "error", err)
 		a.metrics.queueErrorOccurred("len")
 	} else if existed || n > 0 {
 		a.log.Info("resumed existing event queue", "subscription", clientID, "queued", n)
 	} else {
-		a.log.Info("created new event queue", "subscription", clientID)
+		a.log.Info("created new event queue", "subscription", clientID, "params", params)
 	}
 	a.tryDeliver(clientID)
 }

@@ -704,15 +704,14 @@ func TestOnSubscribe_PassesSubscriptionParamsToQueueFactory(t *testing.T) {
 	}
 }
 
-func TestOnSubscribe_ResubscribeDoesNotRecreateQueueOrReinvokeFactory(t *testing.T) {
-	// The factory is only called once per clientID, the first time this
-	// process builds an in-process handle -- a resubscribe (even with
-	// different params) reuses the existing queue rather than calling the
-	// factory again. Documenting this existing, unchanged behavior here
-	// since it's now directly relevant to whether new params ever reach an
-	// existing queue (they don't, today).
+func TestOnSubscribe_ResubscribeWithSameParamsDoesNotRecreateQueue(t *testing.T) {
+	// The factory is only called once per clientID as long as its
+	// subscription parameters don't change -- a resubscribe with the same
+	// params reuses the existing queue rather than calling the factory
+	// again. See TestOnSubscribe_ResubscribeWithDifferentParamsDiscardsOldQueue
+	// for what happens when the params DO change.
 	app, srv := newTestApp(defaultConfig)
-	srv.setConnected("alice/first", true)
+	srv.setConnected("alice/testsource", true)
 
 	calls := 0
 	app.newQueue = func(clientID, params string) clientqueue.Queue {
@@ -720,23 +719,21 @@ func TestOnSubscribe_ResubscribeDoesNotRecreateQueueOrReinvokeFactory(t *testing
 		return clientqueue.NewMemoryQueue(clientID, params)
 	}
 
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/first", "ack": "client-individual"})
-	srv.setConnected("alice/second", true)
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/second", "ack": "client-individual"})
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(subscribeHeaders("alice")) // reconnect with the identical destination
 
 	if calls != 1 {
-		t.Errorf("queueFactory called %d times, want 1 (only on first subscribe)", calls)
+		t.Errorf("queueFactory called %d times, want 1 (params never changed)", calls)
 	}
 }
 
 func TestOnSubscribe_CallsQueueAddedOnceForNewQueue(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
-	srv.setConnected("alice/first", true)
-	srv.setConnected("alice/second", true)
+	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
 
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/first", "ack": "client-individual"})
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/second", "ack": "client-individual"})
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(subscribeHeaders("alice")) // reconnect with the identical destination
 
 	added := source.snapshotAdded()
 	if len(added) != 1 {
@@ -747,6 +744,103 @@ func TestOnSubscribe_CallsQueueAddedOnceForNewQueue(t *testing.T) {
 	app.mu.Unlock()
 	if added[0] != wantQueue {
 		t.Error("QueueAdded was called with a queue other than the one now stored for this client")
+	}
+}
+
+// TestOnSubscribe_ResubscribeWithDifferentParamsDiscardsOldQueue covers a
+// client that connects with one set of subscription parameters, disconnects
+// (or just drops off) without ever sending UNSUBSCRIBE, then reconnects with
+// DIFFERENT parameters. This must be treated exactly like an explicit
+// unsubscribe-then-resubscribe: the old queue is discarded (QueueRemoved +
+// Delete, mirroring onUnsubscribe) and a fresh one is created for the new
+// parameters, rather than silently continuing to serve a queue that was
+// built for parameters the client no longer wants.
+func TestOnSubscribe_ResubscribeWithDifferentParamsDiscardsOldQueue(t *testing.T) {
+	app, srv := newTestApp(defaultConfig)
+	source := app.source.(*fakeEventSource)
+
+	srv.setConnected("alice/paramsA", true)
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsA", "ack": "client-individual"})
+	app.onEvent("Event under paramsA")
+
+	app.mu.Lock()
+	oldQueue := app.queues["alice"]
+	app.mu.Unlock()
+
+	// Drops off without ever sending UNSUBSCRIBE for paramsA...
+	app.onDisconnect(map[string]string{"destination": "alice/paramsA"})
+
+	// ...then reconnects with different subscription parameters.
+	srv.setConnected("alice/paramsB", true)
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsB", "ack": "client-individual"})
+
+	app.mu.Lock()
+	newQueue := app.queues["alice"]
+	app.mu.Unlock()
+
+	if newQueue == oldQueue {
+		t.Fatal("expected a brand-new queue for the new parameters, got the same instance back")
+	}
+	if newQueue.Params() != "paramsB" {
+		t.Errorf("new queue Params() = %q, want paramsB", newQueue.Params())
+	}
+	if n, err := newQueue.Len(); err != nil || n != 0 {
+		t.Errorf("new queue Len() = (%d, %v), want (0, nil) -- must not inherit paramsA's backlog", n, err)
+	}
+	if n, err := oldQueue.Len(); err != nil || n != 0 {
+		t.Errorf("old queue Len() after being discarded = (%d, %v), want (0, nil)", n, err)
+	}
+
+	removed := source.snapshotRemoved()
+	if len(removed) != 1 || removed[0] != oldQueue {
+		t.Errorf("QueueRemoved calls = %v, want exactly one call with the old queue", removed)
+	}
+	added := source.snapshotAdded()
+	if len(added) != 2 || added[0] != oldQueue || added[1] != newQueue {
+		t.Errorf("QueueAdded calls = %v, want [oldQueue, newQueue]", added)
+	}
+}
+
+// TestOnSubscribe_ResubscribeWithDifferentParamsDeletesOldDurableRows is the
+// SQLite-backed variant of the above: it specifically guards against the
+// sqliteQueue rows being keyed only by client id, not by params, which means
+// simply swapping the in-process Queue handle would NOT be enough -- the old
+// parameters' rows would still be sitting under that client id and would
+// immediately resurface as the "new" queue's backlog unless they're
+// explicitly deleted first.
+func TestOnSubscribe_ResubscribeWithDifferentParamsDeletesOldDurableRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "queue.sqlite3")
+	db, err := clientqueue.OpenDB(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	app, srv := newTestApp(defaultConfig)
+	app.newQueue = clientqueue.SQLiteFactory(db, discardLogger())
+
+	srv.setConnected("alice/paramsA", true)
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsA", "ack": "client-individual"})
+	app.onEvent("Event under paramsA") // delivered but never acked, so it stays in queue_events
+
+	app.onDisconnect(map[string]string{"destination": "alice/paramsA"})
+
+	srv.setConnected("alice/paramsB", true)
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsB", "ack": "client-individual"})
+
+	app.mu.Lock()
+	q := app.queues["alice"]
+	app.mu.Unlock()
+	if n, err := q.Len(); err != nil || n != 0 {
+		t.Fatalf("new queue Len() = (%d, %v), want (0, nil) -- paramsA's durable row leaked into paramsB's queue", n, err)
+	}
+
+	clients, err := clientqueue.ListPersistedClients(db)
+	if err != nil {
+		t.Fatalf("ListPersistedClients: %v", err)
+	}
+	if len(clients) != 1 || clients[0].ClientID != "alice" || clients[0].Params != "paramsB" {
+		t.Fatalf("persisted clients = %+v, want exactly one alice row with params=paramsB", clients)
 	}
 }
 
