@@ -234,7 +234,9 @@ func (s *PelicanListingSource) watchedDirectories() []string {
 // independently, so one directory's listing failure can't prevent the
 // others from being checked.
 func (s *PelicanListingSource) poll() {
-	for _, dir := range s.watchedDirectories() {
+	dirs := s.watchedDirectories()
+	s.log.Debug("polling Pelican directories", "dirs", dirs, "count", len(dirs))
+	for _, dir := range dirs {
 		s.pollDirectory(dir)
 	}
 }
@@ -298,6 +300,11 @@ func (s *PelicanListingSource) pollDirectory(dir string) {
 		if !previouslySeen[f.Name] {
 			newFiles = append(newFiles, f)
 		}
+	}
+	if len(newFiles) > 0 {
+		s.log.Debug("new files found in Pelican directory", "url", dir, "new_files", len(newFiles), "total_files", len(files))
+	} else {
+		s.log.Debug("no new files found in Pelican directory", "url", dir, "total_files", len(files))
 	}
 
 	// Emit before persisting: if the process dies between the two, a
