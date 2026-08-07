@@ -122,7 +122,7 @@ func TestSQLiteClientQueue_StoresSubscriptionParams(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	q := sqliteQueueFactory(db)("alice", "topic=weather&qos=1").(*sqliteClientQueue)
+	q := sqliteQueueFactory(db, discardLogger())("alice", "topic=weather&qos=1").(*sqliteClientQueue)
 	if q.params != "topic=weather&qos=1" {
 		t.Errorf("params = %q, want topic=weather&qos=1", q.params)
 	}
@@ -134,7 +134,7 @@ func TestSQLiteClientQueue_Contract(t *testing.T) {
 		t.Fatalf("openQueueDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	factory := sqliteQueueFactory(db)
+	factory := sqliteQueueFactory(db, discardLogger())
 
 	n := 0
 	testClientQueueContract(t, func() clientQueue {
@@ -151,7 +151,7 @@ func TestSQLiteClientQueue_IsolatesByClientID(t *testing.T) {
 		t.Fatalf("openQueueDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	factory := sqliteQueueFactory(db)
+	factory := sqliteQueueFactory(db, discardLogger())
 
 	alice, bob := factory("alice", ""), factory("bob", "")
 	if _, err := alice.Enqueue("a1", 100); err != nil {
@@ -175,7 +175,7 @@ func TestSQLiteClientQueue_DeleteOnlyAffectsOwnClientID(t *testing.T) {
 		t.Fatalf("openQueueDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	factory := sqliteQueueFactory(db)
+	factory := sqliteQueueFactory(db, discardLogger())
 
 	alice, bob := factory("alice", ""), factory("bob", "")
 	if _, err := alice.Enqueue("a1", 100); err != nil {
@@ -204,7 +204,7 @@ func TestSQLiteClientQueue_PersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openQueueDB: %v", err)
 	}
-	q1 := sqliteQueueFactory(db1)("alice", "")
+	q1 := sqliteQueueFactory(db1, discardLogger())("alice", "")
 	if _, err := q1.Enqueue("Event 1", 100); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestSQLiteClientQueue_PersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("reopen openQueueDB: %v", err)
 	}
 	t.Cleanup(func() { db2.Close() })
-	q2 := sqliteQueueFactory(db2)("alice", "")
+	q2 := sqliteQueueFactory(db2, discardLogger())("alice", "")
 
 	got, ok, err := q2.PeekFront()
 	if err != nil || !ok {
@@ -232,5 +232,86 @@ func TestSQLiteClientQueue_PersistsAcrossReopen(t *testing.T) {
 	}
 	if n, _ := q2.Len(); n != 2 {
 		t.Fatalf("Len() after reopen = %d, want 2", n)
+	}
+}
+
+func TestSQLiteQueueFactory_PersistsClientMetadata(t *testing.T) {
+	db, err := openQueueDB(filepath.Join(t.TempDir(), "queue.sqlite3"))
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	sqliteQueueFactory(db, discardLogger())("alice", "osdf/vdc/public/pelican_protocol")
+
+	clients, err := listPersistedClients(db)
+	if err != nil {
+		t.Fatalf("listPersistedClients: %v", err)
+	}
+	if len(clients) != 1 || clients[0].clientID != "alice" || clients[0].params != "osdf/vdc/public/pelican_protocol" {
+		t.Errorf("listPersistedClients() = %+v, want exactly one alice entry with the given params", clients)
+	}
+}
+
+func TestSQLiteQueueFactory_UpsertsMetadataOnReuse(t *testing.T) {
+	db, err := openQueueDB(filepath.Join(t.TempDir(), "queue.sqlite3"))
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	factory := sqliteQueueFactory(db, discardLogger())
+
+	factory("alice", "osdf/vdc/public/a")
+	factory("alice", "osdf/vdc/public/b")
+
+	clients, err := listPersistedClients(db)
+	if err != nil {
+		t.Fatalf("listPersistedClients: %v", err)
+	}
+	if len(clients) != 1 {
+		t.Fatalf("listPersistedClients() = %+v, want exactly one row (updated, not duplicated)", clients)
+	}
+	if clients[0].params != "osdf/vdc/public/b" {
+		t.Errorf("params = %q, want the most recent value osdf/vdc/public/b", clients[0].params)
+	}
+}
+
+func TestSQLiteClientQueue_DeleteRemovesMetadata(t *testing.T) {
+	db, err := openQueueDB(filepath.Join(t.TempDir(), "queue.sqlite3"))
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	factory := sqliteQueueFactory(db, discardLogger())
+
+	alice := factory("alice", "osdf/vdc/public/a")
+	factory("bob", "osdf/vdc/public/b")
+
+	if err := alice.Delete(); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	clients, err := listPersistedClients(db)
+	if err != nil {
+		t.Fatalf("listPersistedClients: %v", err)
+	}
+	if len(clients) != 1 || clients[0].clientID != "bob" {
+		t.Errorf("listPersistedClients() after alice.Delete() = %+v, want only bob remaining", clients)
+	}
+}
+
+func TestListPersistedClients_EmptyWhenNoneYet(t *testing.T) {
+	db, err := openQueueDB(filepath.Join(t.TempDir(), "queue.sqlite3"))
+	if err != nil {
+		t.Fatalf("openQueueDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	clients, err := listPersistedClients(db)
+	if err != nil {
+		t.Fatalf("listPersistedClients: %v", err)
+	}
+	if len(clients) != 0 {
+		t.Errorf("listPersistedClients() on a fresh database = %+v, want empty", clients)
 	}
 }

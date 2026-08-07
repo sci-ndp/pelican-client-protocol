@@ -110,6 +110,38 @@ func (a *messageQueueApp) MetricsHandler() http.Handler {
 	return a.metrics.Handler()
 }
 
+// RehydrateQueues pre-populates a.queues (and notifies a.source via
+// QueueAdded) for every client a durable backing store already remembers,
+// without waiting for that client to reconnect. Intended to be called once
+// at startup, before serving any connections, so e.g.
+// pelicanListingEventSource already knows what to watch on its very first
+// poll instead of only after each client actively resubscribes.
+//
+// A rehydrated queue has no destination yet -- that's only known once the
+// client actually SUBSCRIBEs -- so onEvent will enqueue new events into it
+// (preserving backlog) but onSubscribe's own tryDeliver is what will
+// eventually flush that backlog, once the real client reconnects. A
+// clientID this process has already built a handle for (shouldn't happen
+// this early, but harmless) is left alone rather than replaced.
+func (a *messageQueueApp) RehydrateQueues(clients []persistedClient) {
+	rehydrated := 0
+	for _, c := range clients {
+		a.mu.Lock()
+		if _, existed := a.queues[c.clientID]; existed {
+			a.mu.Unlock()
+			continue
+		}
+		q := a.newQueue(c.clientID, c.params)
+		a.queues[c.clientID] = q
+		a.source.QueueAdded(q)
+		a.mu.Unlock()
+		rehydrated++
+	}
+	if rehydrated > 0 {
+		a.log.Info("rehydrated durable client queues from storage", "count", rehydrated)
+	}
+}
+
 // run is the single goroutine that ever reads from source.Events(); all
 // clientQueue/inFlights mutation elsewhere in this file happens either here
 // or on a connection/timer goroutine, always under a.mu, so there is never a

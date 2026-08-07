@@ -748,6 +748,96 @@ func TestOnSubscribe_CallsQueueAddedOnceForNewQueue(t *testing.T) {
 	}
 }
 
+func TestRehydrateQueues_PopulatesQueuesAndCallsQueueAdded(t *testing.T) {
+	app, _ := newTestApp(defaultMessageQueueConfig)
+	source := app.source.(*fakeEventSource)
+
+	app.RehydrateQueues([]persistedClient{
+		{clientID: "alice", params: "osdf/vdc/public/pelican_protocol"},
+		{clientID: "bob", params: "osdf/vdc/public/other"},
+	})
+
+	app.mu.Lock()
+	aliceQueue, aliceOK := app.queues["alice"]
+	bobQueue, bobOK := app.queues["bob"]
+	app.mu.Unlock()
+	if !aliceOK || !bobOK {
+		t.Fatalf("queues after RehydrateQueues: alice=%v bob=%v, want both present", aliceOK, bobOK)
+	}
+	if aliceQueue.Params() != "osdf/vdc/public/pelican_protocol" {
+		t.Errorf("alice's queue Params() = %q, want osdf/vdc/public/pelican_protocol", aliceQueue.Params())
+	}
+
+	added := source.snapshotAdded()
+	if len(added) != 2 {
+		t.Fatalf("QueueAdded called %d times, want 2", len(added))
+	}
+	if added[0] != aliceQueue || added[1] != bobQueue {
+		t.Errorf("QueueAdded calls = %v, want [aliceQueue, bobQueue] in order", added)
+	}
+}
+
+func TestRehydrateQueues_SkipsClientIDsAlreadyPresent(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	source := app.source.(*fakeEventSource)
+
+	app.onSubscribe(subscribeHeaders("alice")) // a real, already-connected subscribe first
+	app.mu.Lock()
+	originalQueue := app.queues["alice"]
+	app.mu.Unlock()
+
+	app.RehydrateQueues([]persistedClient{{clientID: "alice", params: "should-be-ignored"}})
+
+	app.mu.Lock()
+	currentQueue := app.queues["alice"]
+	app.mu.Unlock()
+	if currentQueue != originalQueue {
+		t.Error("RehydrateQueues replaced an already-existing queue instead of leaving it alone")
+	}
+	if got := source.snapshotAdded(); len(got) != 1 {
+		t.Errorf("QueueAdded called %d times, want 1 (only from the real subscribe, not the redundant rehydrate)", len(got))
+	}
+}
+
+func TestRehydrateQueues_DoesNotMarkClientAsConnected(t *testing.T) {
+	app, _ := newTestApp(defaultMessageQueueConfig)
+
+	app.RehydrateQueues([]persistedClient{{clientID: "alice", params: "osdf/vdc/public/pelican_protocol"}})
+
+	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
+		t.Errorf("connectedClients after RehydrateQueues = %v, want 0 -- a rehydrated queue has no live connection yet", got)
+	}
+	app.mu.Lock()
+	_, hasDestination := app.destinations["alice"]
+	app.mu.Unlock()
+	if hasDestination {
+		t.Error("destinations[\"alice\"] was set by RehydrateQueues, want it unset until a real SUBSCRIBE")
+	}
+}
+
+func TestRehydrateQueues_BacklogIsDeliveredOnceTheRealClientSubscribes(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+
+	app.RehydrateQueues([]persistedClient{{clientID: "alice", params: "testsource"}})
+	app.onEvent("Event 1") // enqueued into the rehydrated queue, but not deliverable yet
+
+	if got := srv.snapshotPublishes(); len(got) != 0 {
+		t.Fatalf("Publish calls before alice ever subscribes = %v, want none", got)
+	}
+
+	srv.setConnected("alice/testsource", true)
+	app.onSubscribe(subscribeHeaders("alice")) // the real client finally reconnects
+
+	publishes := srv.snapshotPublishes()
+	if len(publishes) != 1 {
+		t.Fatalf("Publish calls after the real subscribe = %d, want 1 (the backlog is flushed): %+v", len(publishes), publishes)
+	}
+	if publishes[0].body != "Event 1" {
+		t.Errorf("delivered body = %q, want Event 1", publishes[0].body)
+	}
+}
+
 func TestOnUnsubscribe_CallsQueueRemoved(t *testing.T) {
 	app, srv := newTestApp(defaultMessageQueueConfig)
 	srv.setConnected("alice/testsource", true)
@@ -987,7 +1077,7 @@ func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	}
 	srv1 := newFakeStompServer()
 	srv1.setConnected("carol/testsource", true)
-	app1 := newMessageQueueAppWithConfig(srv1, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db1))
+	app1 := newMessageQueueAppWithConfig(srv1, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db1, discardLogger()))
 	app1.onSubscribe(subscribeHeaders("carol"))
 	app1.onEvent("Event 1") // delivered but never acked
 	if got := srv1.snapshotPublishes(); len(got) != 1 {
@@ -1006,7 +1096,7 @@ func TestMessageQueueApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	t.Cleanup(func() { db2.Close() })
 	srv2 := newFakeStompServer()
 	srv2.setConnected("carol/testsource", true)
-	app2 := newMessageQueueAppWithConfig(srv2, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db2))
+	app2 := newMessageQueueAppWithConfig(srv2, discardLogger(), newFakeEventSource(), defaultMessageQueueConfig, sqliteQueueFactory(db2, discardLogger()))
 	app2.onSubscribe(subscribeHeaders("carol"))
 
 	publishes := srv2.snapshotPublishes()
@@ -1039,7 +1129,7 @@ func TestOnSubscribe_ReconnectWithoutRestartDoesNotDoubleCountGauge(t *testing.T
 	t.Cleanup(func() { db.Close() })
 
 	app, srv := newTestApp(defaultMessageQueueConfig)
-	app.newQueue = sqliteQueueFactory(db)
+	app.newQueue = sqliteQueueFactory(db, discardLogger())
 	srv.setConnected("dave/testsource", true)
 
 	app.onSubscribe(subscribeHeaders("dave"))

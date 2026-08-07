@@ -56,14 +56,21 @@ func main() {
 	mux.Handle("/", stomp.RequireAuth(authenticator, listener))
 
 	newQueue := queueFactory(newMemoryClientQueue)
+	var persistedClients []persistedClient
 	if *queueDB != "" {
 		db, err := openQueueDB(*queueDB)
 		if err != nil {
 			logger.Error("failed to open queue database", "error", err)
 			os.Exit(1)
 		}
-		newQueue = sqliteQueueFactory(db)
+		newQueue = sqliteQueueFactory(db, logger)
 		logger.Info("using on-disk client queues", "queue-db", *queueDB)
+
+		persistedClients, err = listPersistedClients(db)
+		if err != nil {
+			logger.Error("failed to list persisted clients", "error", err)
+			os.Exit(1)
+		}
 	} else {
 		logger.Info("using in-memory client queues")
 	}
@@ -103,6 +110,11 @@ func main() {
 
 	srv := stomp.NewServer(logger)
 	app := newMessageQueueApp(srv, logger, source, newQueue)
+	// Pre-populate queues (and notify source) for durable clients from a
+	// prior process run, before serving any connections -- otherwise e.g.
+	// the Pelican watcher wouldn't know to watch their directories until
+	// each one happens to reconnect.
+	app.RehydrateQueues(persistedClients)
 	// Dashboards (e.g. server-ui) are typically served from a different
 	// origin than this server, so allow cross-origin GETs of this read-only,
 	// non-sensitive endpoint.
