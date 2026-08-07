@@ -6,26 +6,62 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-// fakePelicanLister is a pelicanListingRunner test double: it returns
-// whatever fixed responses were queued for it, one per call, so tests can
-// drive successive polls without a real pelican binary or federation.
+// fakePelicanLister is a pelicanListingRunner test double: for each
+// directory URL it's asked to list, it returns responses from a
+// per-directory queue (one per call to that directory, repeating the last
+// once exhausted), and records every directory it was asked to list so
+// tests can assert on what actually got polled.
 type fakePelicanLister struct {
-	responses []func() ([]pelicanObject, error)
-	calls     int
+	mu        sync.Mutex
+	responses map[string][]func() ([]pelicanObject, error)
+	calls     map[string]int
+	callLog   []string
 }
 
-func (f *fakePelicanLister) list(ctx context.Context, listingURL string) ([]pelicanObject, error) {
-	i := f.calls
-	if i >= len(f.responses) {
-		i = len(f.responses) - 1 // repeat the last response forever
+func newFakePelicanLister() *fakePelicanLister {
+	return &fakePelicanLister{
+		responses: map[string][]func() ([]pelicanObject, error){},
+		calls:     map[string]int{},
 	}
-	f.calls++
-	return f.responses[i]()
+}
+
+func (f *fakePelicanLister) queue(dir string, resp func() ([]pelicanObject, error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.responses[dir] = append(f.responses[dir], resp)
+}
+
+func (f *fakePelicanLister) list(ctx context.Context, dir string) ([]pelicanObject, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callLog = append(f.callLog, dir)
+	resps := f.responses[dir]
+	if len(resps) == 0 {
+		return nil, nil
+	}
+	i := f.calls[dir]
+	if i >= len(resps) {
+		i = len(resps) - 1
+	}
+	f.calls[dir]++
+	return resps[i]()
+}
+
+func (f *fakePelicanLister) callCount(dir string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[dir]
+}
+
+func (f *fakePelicanLister) totalCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.callLog)
 }
 
 func objectsResponse(objects ...pelicanObject) func() ([]pelicanObject, error) {
@@ -44,20 +80,163 @@ func dir(name string) pelicanObject {
 	return pelicanObject{Name: name, IsCollection: true}
 }
 
-func TestPelicanListingEventSource_FirstPollSeedsBaselineWithoutEmitting(t *testing.T) {
-	lister := &fakePelicanLister{responses: []func() ([]pelicanObject, error){
-		objectsResponse(
-			dir("/vdc/public/pelican_protocol/subdir"),
-			file("/vdc/public/pelican_protocol/a.txt"),
-			file("/vdc/public/pelican_protocol/b.txt"),
-		),
-	}}
-	statePath := filepath.Join(t.TempDir(), "state.txt")
-	s, err := newPelicanListingEventSourceState("osdf://vdc/public/pelican_protocol", statePath, lister.list, discardLogger())
+// queueWithParams is a clientQueue for tests that only care about Params()
+// (used to drive QueueAdded/ShouldNotify) -- the clientID is irrelevant, and
+// each call returns a distinct instance (memoryClientQueue is a pointer
+// type), so two queues built with the same params are still distinct
+// tracked entries, matching two different real clients watching the same
+// directory.
+func queueWithParams(params string) clientQueue {
+	return newMemoryClientQueue("test-client", params)
+}
+
+func TestPelicanDirectoryFromParams(t *testing.T) {
+	cases := []struct {
+		params  string
+		wantDir string
+		wantOK  bool
+	}{
+		{"osdf/vdc/public/pelican_protocol", "osdf://vdc/public/pelican_protocol", true},
+		{"pelican/foo/bar", "pelican://foo/bar", true},
+		{"osdf", "", false},        // no "/" at all
+		{"osdf/", "", false},       // empty object path
+		{"/vdc/public", "", false}, // empty protocol
+		{"", "", false},
+	}
+	for _, c := range cases {
+		dir, ok := pelicanDirectoryFromParams(c.params)
+		if dir != c.wantDir || ok != c.wantOK {
+			t.Errorf("pelicanDirectoryFromParams(%q) = (%q, %v), want (%q, %v)", c.params, dir, ok, c.wantDir, c.wantOK)
+		}
+	}
+}
+
+func TestPelicanURLDir(t *testing.T) {
+	cases := []struct {
+		url  string
+		want string
+	}{
+		{"osdf://vdc/public/pelican_protocol/hello.txt", "osdf://vdc/public/pelican_protocol"},
+		{"osdf://vdc/public/pelican_protocol/sub/hello.txt", "osdf://vdc/public/pelican_protocol/sub"},
+		{"no-scheme-here", "no-scheme-here"},
+	}
+	for _, c := range cases {
+		if got := pelicanURLDir(c.url); got != c.want {
+			t.Errorf("pelicanURLDir(%q) = %q, want %q", c.url, got, c.want)
+		}
+	}
+}
+
+func TestPelicanListingEventSource_NoTrackedQueuesPollsNothing(t *testing.T) {
+	lister := newFakePelicanLister()
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
 	if err != nil {
 		t.Fatalf("newPelicanListingEventSourceState: %v", err)
 	}
 
+	s.poll()
+
+	if got := lister.totalCalls(); got != 0 {
+		t.Errorf("lister called %d times with no tracked queues, want 0", got)
+	}
+}
+
+func TestPelicanListingEventSource_DiscoversDirectoryFromTrackedQueueParams(t *testing.T) {
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
+	s.poll()
+
+	if got := lister.callCount("osdf://vdc/public/pelican_protocol"); got != 1 {
+		t.Errorf("lister called %d times for the tracked queue's directory, want 1", got)
+	}
+}
+
+func TestPelicanListingEventSource_UnionsMultipleClientsSameDirectory(t *testing.T) {
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
+	s.poll()
+
+	if got := lister.callCount("osdf://vdc/public/pelican_protocol"); got != 1 {
+		t.Errorf("lister called %d times for a directory watched by 2 clients, want 1 (union, not per-client)", got)
+	}
+}
+
+func TestPelicanListingEventSource_WatchesMultipleDistinctDirectories(t *testing.T) {
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/a", objectsResponse(file("/vdc/public/a/x.txt")))
+	lister.queue("osdf://vdc/public/b", objectsResponse(file("/vdc/public/b/y.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+
+	s.QueueAdded(queueWithParams("osdf/vdc/public/a"))
+	s.QueueAdded(queueWithParams("osdf/vdc/public/b"))
+	s.poll()
+
+	if got := lister.callCount("osdf://vdc/public/a"); got != 1 {
+		t.Errorf("directory a called %d times, want 1", got)
+	}
+	if got := lister.callCount("osdf://vdc/public/b"); got != 1 {
+		t.Errorf("directory b called %d times, want 1", got)
+	}
+}
+
+func TestPelicanListingEventSource_QueueRemovedStopsWatchingDirectoryWithNoOtherClient(t *testing.T) {
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+
+	q := queueWithParams("osdf/vdc/public/pelican_protocol")
+	s.QueueAdded(q)
+	s.poll()
+	if got := lister.callCount("osdf://vdc/public/pelican_protocol"); got != 1 {
+		t.Fatalf("directory called %d times before removal, want 1", got)
+	}
+
+	s.QueueRemoved(q)
+	s.poll()
+
+	if got := lister.callCount("osdf://vdc/public/pelican_protocol"); got != 1 {
+		t.Errorf("directory called %d times after its only client was removed, want still 1 (not polled again)", got)
+	}
+}
+
+func TestPelicanListingEventSource_FirstPollOfDirectorySeedsBaselineWithoutEmitting(t *testing.T) {
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(
+		dir("/vdc/public/pelican_protocol/subdir"),
+		file("/vdc/public/pelican_protocol/a.txt"),
+		file("/vdc/public/pelican_protocol/b.txt"),
+	))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
 	s.poll()
 
 	select {
@@ -70,26 +249,26 @@ func TestPelicanListingEventSource_FirstPollSeedsBaselineWithoutEmitting(t *test
 	if err != nil {
 		t.Fatalf("read state file: %v", err)
 	}
-	for _, want := range []string{"/vdc/public/pelican_protocol/a.txt", "/vdc/public/pelican_protocol/b.txt"} {
-		if !strings.Contains(string(data), want) {
-			t.Errorf("state file %q does not contain %q", data, want)
-		}
+	var persisted map[string][]string
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatalf("state file is not valid JSON: %v", err)
 	}
-	if strings.Contains(string(data), "subdir") {
-		t.Errorf("state file %q should not contain the subdirectory entry", data)
+	names := persisted["osdf://vdc/public/pelican_protocol"]
+	if len(names) != 2 {
+		t.Fatalf("persisted names = %v, want exactly a.txt and b.txt (no subdir)", names)
 	}
 }
 
 func TestPelicanListingEventSource_EmitsOneEventPerNewFileOnSubsequentPoll(t *testing.T) {
-	lister := &fakePelicanLister{responses: []func() ([]pelicanObject, error){
-		objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")),
-		objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt"), file("/vdc/public/pelican_protocol/c.txt")),
-	}}
-	statePath := filepath.Join(t.TempDir(), "state.txt")
-	s, err := newPelicanListingEventSourceState("osdf://vdc/public/pelican_protocol", statePath, lister.list, discardLogger())
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")))
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt"), file("/vdc/public/pelican_protocol/c.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
 	if err != nil {
 		t.Fatalf("newPelicanListingEventSourceState: %v", err)
 	}
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
 
 	s.poll() // seeds baseline: a.txt, b.txt
 	select {
@@ -127,20 +306,27 @@ func TestPelicanListingEventSource_EmitsOneEventPerNewFileOnSubsequentPoll(t *te
 }
 
 func TestPelicanListingEventSource_ResumesFromExistingStateFileAcrossRestart(t *testing.T) {
-	statePath := filepath.Join(t.TempDir(), "state.txt")
-	if err := os.WriteFile(statePath, []byte("/vdc/public/pelican_protocol/a.txt\n/vdc/public/pelican_protocol/b.txt\n"), 0o644); err != nil {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	seed := map[string][]string{
+		"osdf://vdc/public/pelican_protocol": {"/vdc/public/pelican_protocol/a.txt", "/vdc/public/pelican_protocol/b.txt"},
+	}
+	data, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatalf("marshal seed: %v", err)
+	}
+	if err := os.WriteFile(statePath, data, 0o644); err != nil {
 		t.Fatalf("seed state file: %v", err)
 	}
 
-	lister := &fakePelicanLister{responses: []func() ([]pelicanObject, error){
-		objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt"), file("/vdc/public/pelican_protocol/c.txt")),
-	}}
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt"), file("/vdc/public/pelican_protocol/c.txt")))
 	// A fresh instance, simulating a process restart, reads the pre-existing
 	// state file rather than starting from an empty baseline.
-	s, err := newPelicanListingEventSourceState("osdf://vdc/public/pelican_protocol", statePath, lister.list, discardLogger())
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
 	if err != nil {
 		t.Fatalf("newPelicanListingEventSourceState: %v", err)
 	}
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
 
 	s.poll()
 
@@ -165,16 +351,16 @@ func TestPelicanListingEventSource_ResumesFromExistingStateFileAcrossRestart(t *
 }
 
 func TestPelicanListingEventSource_IgnoresEmptyResultWhenPreviouslyNonEmpty(t *testing.T) {
-	lister := &fakePelicanLister{responses: []func() ([]pelicanObject, error){
-		objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")),
-		objectsResponse(), // anomalous empty result
-		objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")),
-	}}
-	statePath := filepath.Join(t.TempDir(), "state.txt")
-	s, err := newPelicanListingEventSourceState("osdf://vdc/public/pelican_protocol", statePath, lister.list, discardLogger())
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")))
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse()) // anomalous empty result
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
 	if err != nil {
 		t.Fatalf("newPelicanListingEventSourceState: %v", err)
 	}
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
 
 	s.poll() // seeds baseline: a.txt, b.txt
 	s.poll() // anomalous empty result -- must be ignored, not treated as mass deletion
@@ -184,8 +370,11 @@ func TestPelicanListingEventSource_IgnoresEmptyResultWhenPreviouslyNonEmpty(t *t
 		t.Fatalf("anomalous empty poll emitted an event, want none: %q", ev)
 	default:
 	}
-	if len(s.seen) != 2 {
-		t.Fatalf("seen set after anomalous empty poll = %d entries, want still 2 (unaffected)", len(s.seen))
+	s.mu.Lock()
+	seenCount := len(s.seen["osdf://vdc/public/pelican_protocol"])
+	s.mu.Unlock()
+	if seenCount != 2 {
+		t.Fatalf("seen set after anomalous empty poll = %d entries, want still 2 (unaffected)", seenCount)
 	}
 
 	s.poll() // back to normal: a.txt/b.txt must NOT be re-announced as new
@@ -197,15 +386,41 @@ func TestPelicanListingEventSource_IgnoresEmptyResultWhenPreviouslyNonEmpty(t *t
 	}
 }
 
-func TestPelicanListingEventSource_ListErrorDoesNotModifyState(t *testing.T) {
-	lister := &fakePelicanLister{responses: []func() ([]pelicanObject, error){
-		errorResponse(errors.New("federation unreachable")),
-	}}
-	statePath := filepath.Join(t.TempDir(), "state.txt")
-	s, err := newPelicanListingEventSourceState("osdf://vdc/public/pelican_protocol", statePath, lister.list, discardLogger())
+func TestPelicanListingEventSource_ListErrorForOneDirectoryDoesNotAffectOthers(t *testing.T) {
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/broken", errorResponse(errors.New("federation unreachable")))
+	lister.queue("osdf://vdc/public/ok", objectsResponse(file("/vdc/public/ok/a.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
 	if err != nil {
 		t.Fatalf("newPelicanListingEventSourceState: %v", err)
 	}
+	s.QueueAdded(queueWithParams("osdf/vdc/public/broken"))
+	s.QueueAdded(queueWithParams("osdf/vdc/public/ok"))
+
+	s.poll()
+
+	s.mu.Lock()
+	_, brokenSeeded := s.seen["osdf://vdc/public/broken"]
+	_, okSeeded := s.seen["osdf://vdc/public/ok"]
+	s.mu.Unlock()
+	if brokenSeeded {
+		t.Error("the broken directory got a baseline despite its list() call failing")
+	}
+	if !okSeeded {
+		t.Error("the ok directory's baseline was never seeded -- one directory's error should not block another's poll")
+	}
+}
+
+func TestPelicanListingEventSource_ListErrorDoesNotModifyState(t *testing.T) {
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", errorResponse(errors.New("federation unreachable")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
 
 	s.poll()
 
@@ -219,25 +434,61 @@ func TestPelicanListingEventSource_ListErrorDoesNotModifyState(t *testing.T) {
 	}
 }
 
-func TestPelicanListingEventSource_RejectsSchemelessURL(t *testing.T) {
-	if _, err := newPelicanListingEventSourceState("not-a-url", filepath.Join(t.TempDir(), "state.txt"), (&fakePelicanLister{}).list, discardLogger()); err == nil {
-		t.Fatal("expected an error for a URL without a scheme")
+func TestPelicanListingEventSource_ShouldNotify_OnlyNotifiesClientSubscribedToMatchingDirectory(t *testing.T) {
+	lister := newFakePelicanLister()
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+
+	event, err := json.Marshal(pelicanFileEvent{Name: "hello.txt", URL: "osdf://vdc/public/pelican_protocol/hello.txt"})
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+
+	matching := queueWithParams("osdf/vdc/public/pelican_protocol")
+	other := queueWithParams("osdf/vdc/public/some_other_protocol")
+
+	if !s.ShouldNotify(string(event), matching) {
+		t.Error("ShouldNotify() = false for the client subscribed to the event's own directory, want true")
+	}
+	if s.ShouldNotify(string(event), other) {
+		t.Error("ShouldNotify() = true for a client subscribed to a different directory, want false")
+	}
+}
+
+func TestPelicanListingEventSource_ShouldNotify_RejectsClientWithUnparsableParams(t *testing.T) {
+	lister := newFakePelicanLister()
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
+	if err != nil {
+		t.Fatalf("newPelicanListingEventSourceState: %v", err)
+	}
+
+	event, err := json.Marshal(pelicanFileEvent{Name: "hello.txt", URL: "osdf://vdc/public/pelican_protocol/hello.txt"})
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+
+	if s.ShouldNotify(string(event), queueWithParams("not-a-directory-spec")) {
+		t.Error("ShouldNotify() = true for a client whose params don't name a Pelican directory, want false")
 	}
 }
 
 func TestPelicanListingEventSource_RealTickerWiring(t *testing.T) {
 	// A lightweight sanity check that run() actually wires a real ticker to
-	// poll() and to the Events() channel, rather than testing poll() in
-	// isolation like the other tests here.
-	lister := &fakePelicanLister{responses: []func() ([]pelicanObject, error){
-		objectsResponse(file("/vdc/public/pelican_protocol/a.txt")),
-		objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")),
-	}}
-	statePath := filepath.Join(t.TempDir(), "state.txt")
-	s, err := newPelicanListingEventSourceState("osdf://vdc/public/pelican_protocol", statePath, lister.list, discardLogger())
+	// poll() and to the Events() channel, and that QueueAdded takes effect
+	// on the very next tick.
+	lister := newFakePelicanLister()
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt")))
+	lister.queue("osdf://vdc/public/pelican_protocol", objectsResponse(file("/vdc/public/pelican_protocol/a.txt"), file("/vdc/public/pelican_protocol/b.txt")))
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	s, err := newPelicanListingEventSourceState(statePath, lister.list, discardLogger())
 	if err != nil {
 		t.Fatalf("newPelicanListingEventSourceState: %v", err)
 	}
+	s.QueueAdded(queueWithParams("osdf/vdc/public/pelican_protocol"))
 	go s.run(time.Millisecond)
 
 	select {

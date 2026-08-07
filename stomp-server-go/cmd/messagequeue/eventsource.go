@@ -21,15 +21,36 @@ type EventSource interface {
 	// messageQueueApp's single event-processing goroutine while a.mu is
 	// held, so it must not block or call back into messageQueueApp.
 	ShouldNotify(event string, q clientQueue) bool
+
+	// QueueAdded is called once, synchronously, whenever messageQueueApp
+	// creates a brand-new client queue -- a client's first-ever subscribe
+	// in this process's lifetime, not a resubscribe/reconnect that resumes
+	// an existing queue. Lets an EventSource that needs to know which
+	// clients exist (e.g. to derive what to watch from their subscription
+	// parameters) stay up to date without reaching back into
+	// messageQueueApp, which doesn't exist yet at the point an EventSource
+	// is itself constructed. Must not block or call back into
+	// messageQueueApp.
+	QueueAdded(q clientQueue)
+
+	// QueueRemoved is called once, synchronously, whenever messageQueueApp
+	// permanently deletes a client queue (an explicit UNSUBSCRIBE, see
+	// clientQueue.Delete) -- not on a mere disconnect, since a queue
+	// persists across those so the client can reconnect and resume it.
+	// Must not block or call back into messageQueueApp.
+	QueueRemoved(q clientQueue)
 }
 
 // defaultNotifier is embedded by EventSource implementations that don't need
-// per-client filtering: it always says yes, matching the original
-// fan-out-to-every-client behavior. Embed it to get ShouldNotify for free;
-// override it (define your own ShouldNotify method) to filter.
+// per-client filtering or queue tracking: ShouldNotify always says yes,
+// matching the original fan-out-to-every-client behavior, and
+// QueueAdded/QueueRemoved are no-ops. Embed it to get all three for free;
+// define your own method(s) to override just the ones you need.
 type defaultNotifier struct{}
 
 func (defaultNotifier) ShouldNotify(event string, q clientQueue) bool { return true }
+func (defaultNotifier) QueueAdded(q clientQueue)                      {}
+func (defaultNotifier) QueueRemoved(q clientQueue)                    {}
 
 // tickerEventSource is a demo EventSource that emits an incrementing
 // "Event <n>" string on a fixed interval.

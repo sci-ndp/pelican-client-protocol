@@ -29,6 +29,11 @@ type clientQueue interface {
 	// reconnect and resume its queue later), Delete represents the client
 	// explicitly saying it's done -- called when it UNSUBSCRIBEs.
 	Delete() error
+
+	// Params returns the subscription parameters this queue was created
+	// with (see queueFactory) -- the destination's contents after the
+	// client's own leading "<clientID>/" segment.
+	Params() string
 }
 
 // queueFactory creates the clientQueue for a client id the app has not yet
@@ -45,8 +50,7 @@ type memoryClientQueue struct {
 	events []string // oldest first
 
 	// params is the subscription parameters this client's queue was created
-	// with (see queueFactory). Stored for future use; nothing yet
-	// interprets its contents.
+	// with (see queueFactory and Params).
 	params string
 }
 
@@ -86,3 +90,5 @@ func (q *memoryClientQueue) Delete() error {
 	q.events = nil
 	return nil
 }
+
+func (q *memoryClientQueue) Params() string { return q.params }

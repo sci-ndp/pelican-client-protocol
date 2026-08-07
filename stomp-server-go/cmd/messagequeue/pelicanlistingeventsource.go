@@ -11,6 +11,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -68,69 +69,98 @@ func execPelicanListing(pelicanBinary string) pelicanListingRunner {
 	}
 }
 
-// pelicanListingEventSource polls a Pelican federation directory (e.g. an
-// osdf:// URL) on a fixed interval, diffs the files it lists against what
-// was last observed, and emits one event per file that's newly appeared.
-// The observed set is persisted to statePath after every poll that changes
-// it, so a restarted process resumes from where it left off instead of
-// re-announcing every file already on the server as new.
-//
-// This only looks at the one directory named by listingURL: entries with
-// IsCollection true are subdirectories and are skipped, not recursed into
-// (pelican object ls is non-recursive by default, matching that scope).
-//
-// The very first poll ever run against a given statePath (i.e. no state
-// file exists yet) seeds the baseline silently, without emitting any
-// events -- otherwise every process's first startup against an established
-// directory would flood every connected client with one event per
-// pre-existing file. "New" specifically means "appeared since the last
-// poll", not "exists".
-type pelicanListingEventSource struct {
-	defaultNotifier
-	listingURL string
-	statePath  string
-	list       pelicanListingRunner
-	log        *slog.Logger
-	ch         chan string
-	seen       map[string]bool
+// pelicanDirectoryFromParams parses a client's subscription parameters (see
+// subscriptionParams) of the form "<protocol>/<object path>" -- e.g.
+// "osdf/vdc/public/pelican_protocol" -- into a Pelican federation directory
+// URL, e.g. "osdf://vdc/public/pelican_protocol". ok is false if params
+// doesn't contain a "/" with a non-empty protocol and path on either side,
+// meaning that client isn't naming a Pelican directory at all.
+func pelicanDirectoryFromParams(params string) (dir string, ok bool) {
+	protocol, objectPath, found := strings.Cut(params, "/")
+	if !found || protocol == "" || objectPath == "" {
+		return "", false
+	}
+	return protocol + "://" + objectPath, true
+}
 
-	// baselineSeeded is true once this instance has established a starting
-	// point to diff against -- either statePath already existed at
-	// construction time, or an earlier poll() call set it.
-	baselineSeeded bool
+// pelicanURLDir returns the directory portion of a Pelican federation
+// object URL, e.g. "osdf://vdc/public/pelican_protocol/hello.txt" ->
+// "osdf://vdc/public/pelican_protocol". Operates on the path portion only
+// (after stripping "scheme://") since path.Dir would otherwise collapse the
+// "//" right after the scheme (path.Dir treats runs of slashes as plain
+// separators, e.g. path.Dir("osdf://a/b") == "osdf:/a", silently corrupting
+// the scheme).
+func pelicanURLDir(u string) string {
+	scheme, rest, ok := strings.Cut(u, "://")
+	if !ok {
+		return u
+	}
+	return scheme + "://" + path.Dir(rest)
+}
+
+// pelicanListingEventSource dynamically discovers which Pelican federation
+// directories to watch from the subscription parameters of every currently
+// active client queue (see clientQueue.Params, pelicanDirectoryFromParams),
+// rather than a single directory fixed at construction. It polls the union
+// of those directories on a fixed interval via the pelican CLI, diffs each
+// directory's files against what was last observed there, and emits one
+// event per file that's newly appeared in any watched directory.
+// ShouldNotify then filters delivery back down so a client only ever sees
+// events for its own directory, never another client's.
+//
+// A client queue becomes tracked (and its directory starts being watched)
+// via QueueAdded, and stops via QueueRemoved -- see messageQueueApp's
+// onSubscribe/onUnsubscribe. A queue whose Params don't parse as
+// "<protocol>/<path>" contributes no directory.
+//
+// This only looks at the one directory named by each client's params:
+// entries with IsCollection true are subdirectories and are skipped, not
+// recursed into (pelican object ls is non-recursive by default, matching
+// that scope).
+//
+// The very first poll of a given directory (no prior state for it) seeds
+// that directory's baseline silently, without emitting any events --
+// otherwise a client subscribing to an already-established directory would
+// be flooded with one event per pre-existing file. "New" specifically means
+// "appeared since the last poll of this directory", not "exists".
+type pelicanListingEventSource struct {
+	statePath string
+	list      pelicanListingRunner
+	log       *slog.Logger
+	ch        chan string
+
+	mu      sync.Mutex
+	tracked map[clientQueue]bool       // currently active client queues
+	seen    map[string]map[string]bool // directory URL -> observed file names; a directory's key exists once its baseline has been seeded
 }
 
 // newPelicanListingEventSourceState loads statePath's previously-observed
-// file set (empty if the file doesn't exist yet) and returns a
-// pelicanListingEventSource ready to use, without starting its background
+// per-directory file sets (empty if the file doesn't exist yet) and returns
+// a pelicanListingEventSource ready to use, without starting its background
 // poll loop -- split out from newPelicanListingEventSource so tests can call
 // poll() directly with a fake pelicanListingRunner on a compressed,
 // non-realtime schedule.
-func newPelicanListingEventSourceState(listingURL, statePath string, list pelicanListingRunner, log *slog.Logger) (*pelicanListingEventSource, error) {
-	if !strings.Contains(listingURL, "://") {
-		return nil, fmt.Errorf("invalid listing URL (missing scheme): %s", listingURL)
-	}
-	seen, existed, err := readFileSet(statePath)
+func newPelicanListingEventSourceState(statePath string, list pelicanListingRunner, log *slog.Logger) (*pelicanListingEventSource, error) {
+	seen, err := readDirectorySets(statePath)
 	if err != nil {
 		return nil, err
 	}
 	return &pelicanListingEventSource{
-		listingURL:     listingURL,
-		statePath:      statePath,
-		list:           list,
-		log:            log,
-		ch:             make(chan string, 1),
-		seen:           seen,
-		baselineSeeded: existed,
+		statePath: statePath,
+		list:      list,
+		log:       log,
+		ch:        make(chan string, 1),
+		tracked:   map[clientQueue]bool{},
+		seen:      seen,
 	}, nil
 }
 
-// newPelicanListingEventSource loads statePath's previously-observed file
-// set and starts polling listingURL every interval via pelicanBinary's
-// "object ls", persisting the observed set back to statePath after every
-// poll.
-func newPelicanListingEventSource(listingURL string, interval time.Duration, statePath, pelicanBinary string, log *slog.Logger) (*pelicanListingEventSource, error) {
-	s, err := newPelicanListingEventSourceState(listingURL, statePath, execPelicanListing(pelicanBinary), log)
+// newPelicanListingEventSource loads statePath's previously-observed
+// per-directory file sets and starts polling the union of watched
+// directories every interval via pelicanBinary's "object ls", persisting
+// the observed sets back to statePath after every poll.
+func newPelicanListingEventSource(interval time.Duration, statePath, pelicanBinary string, log *slog.Logger) (*pelicanListingEventSource, error) {
+	s, err := newPelicanListingEventSourceState(statePath, execPelicanListing(pelicanBinary), log)
 	if err != nil {
 		return nil, err
 	}
@@ -148,17 +178,77 @@ func (s *pelicanListingEventSource) run(interval time.Duration) {
 	}
 }
 
-// poll lists the current directory contents, emits one event per file not
-// already in s.seen, and persists the updated set. Any error (listing,
-// unexpected-empty-result, or persist) is logged and leaves s.seen
-// unmodified, so the next tick retries the diff fresh rather than forgetting
-// or double-reporting history.
+// QueueAdded implements EventSource.
+func (s *pelicanListingEventSource) QueueAdded(q clientQueue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tracked[q] = true
+}
+
+// QueueRemoved implements EventSource. The directory q named (if any) stops
+// being polled once no other tracked queue still names it; its "seen" state
+// simply lingers, unpolled, rather than being cleaned up.
+func (s *pelicanListingEventSource) QueueRemoved(q clientQueue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tracked, q)
+}
+
+// ShouldNotify implements EventSource: a client only ever sees new-file
+// events for the one Pelican directory named by its own subscription
+// parameters, never another client's directory.
+func (s *pelicanListingEventSource) ShouldNotify(event string, q clientQueue) bool {
+	dir, ok := pelicanDirectoryFromParams(q.Params())
+	if !ok {
+		return false
+	}
+	var e pelicanFileEvent
+	if err := json.Unmarshal([]byte(event), &e); err != nil {
+		return false
+	}
+	return pelicanURLDir(e.URL) == dir
+}
+
+// watchedDirectories returns the current union of Pelican directories named
+// by every tracked client queue's subscription parameters.
+func (s *pelicanListingEventSource) watchedDirectories() []string {
+	s.mu.Lock()
+	dirSet := map[string]bool{}
+	for q := range s.tracked {
+		if dir, ok := pelicanDirectoryFromParams(q.Params()); ok {
+			dirSet[dir] = true
+		}
+	}
+	s.mu.Unlock()
+
+	dirs := make([]string, 0, len(dirSet))
+	for d := range dirSet {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs) // deterministic polling order, easier to reason about/log
+	return dirs
+}
+
+// poll lists every currently-watched directory and processes each
+// independently, so one directory's listing failure can't prevent the
+// others from being checked.
 func (s *pelicanListingEventSource) poll() {
+	for _, dir := range s.watchedDirectories() {
+		s.pollDirectory(dir)
+	}
+}
+
+// pollDirectory lists dir, emits one event per file not already observed
+// there, and persists the updated state. Any error (listing,
+// unexpected-empty-result, or persist) is logged and leaves this
+// directory's seen set unmodified, so the next poll retries the diff fresh
+// rather than forgetting or double-reporting history.
+func (s *pelicanListingEventSource) pollDirectory(dir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), pelicanListTimeout)
 	defer cancel()
-	objects, err := s.list(ctx, s.listingURL)
+	objects, err := s.list(ctx, dir)
 	if err != nil {
-		s.log.Error("failed to list Pelican directory", "url", s.listingURL, "error", err)
+		s.log.Error("failed to list Pelican directory", "url", dir, "error", err)
 		return
 	}
 
@@ -169,15 +259,19 @@ func (s *pelicanListingEventSource) poll() {
 		}
 	}
 
+	s.mu.Lock()
+	previouslySeen, baselineSeeded := s.seen[dir]
+	s.mu.Unlock()
+
 	// A directory that legitimately has zero files is possible, but so is a
 	// misbehaving federation component returning an empty/unexpected result.
-	// Treating that as "everything was deleted" would wipe s.seen, and the
-	// next successful poll would then re-announce every real file as
-	// newly-appeared. Refuse to accept an empty result once a non-empty
-	// baseline has been established.
-	if len(files) == 0 && len(s.seen) > 0 {
+	// Treating that as "everything was deleted" would wipe this directory's
+	// seen set, and the next successful poll would then re-announce every
+	// real file as newly-appeared. Refuse to accept an empty result once a
+	// non-empty baseline has been established.
+	if len(files) == 0 && len(previouslySeen) > 0 {
 		s.log.Warn("Pelican directory listing came back empty; ignoring this poll rather than treating it as every file being deleted",
-			"url", s.listingURL, "previously_observed", len(s.seen))
+			"url", dir, "previously_observed", len(previouslySeen))
 		return
 	}
 
@@ -186,20 +280,21 @@ func (s *pelicanListingEventSource) poll() {
 		current[f.Name] = true
 	}
 
-	if !s.baselineSeeded {
-		s.seen = current
-		s.baselineSeeded = true
-		if err := writeFileSet(s.statePath, current); err != nil {
+	if !baselineSeeded {
+		s.mu.Lock()
+		s.seen[dir] = current
+		s.mu.Unlock()
+		if err := s.persist(); err != nil {
 			s.log.Error("failed to persist observed file list", "path", s.statePath, "error", err)
 		}
 		s.log.Info("seeded Pelican listing baseline without emitting events for pre-existing files",
-			"url", s.listingURL, "files", len(current))
+			"url", dir, "files", len(current))
 		return
 	}
 
 	var newFiles []pelicanObject
 	for _, f := range files {
-		if !s.seen[f.Name] {
+		if !previouslySeen[f.Name] {
 			newFiles = append(newFiles, f)
 		}
 	}
@@ -208,7 +303,7 @@ func (s *pelicanListingEventSource) poll() {
 	// restart re-diffs against the same not-yet-updated state and re-emits
 	// these same files as new again -- an at-least-once duplicate here is
 	// far preferable to silently never announcing a file that arrived.
-	scheme := listingURLScheme(s.listingURL)
+	scheme, _, _ := strings.Cut(dir, "://")
 	for _, f := range newFiles {
 		payload, err := json.Marshal(pelicanFileEvent{
 			Name:    path.Base(f.Name),
@@ -223,58 +318,60 @@ func (s *pelicanListingEventSource) poll() {
 		s.ch <- string(payload)
 	}
 
-	s.seen = current
-	if err := writeFileSet(s.statePath, current); err != nil {
+	s.mu.Lock()
+	s.seen[dir] = current
+	s.mu.Unlock()
+	if err := s.persist(); err != nil {
 		s.log.Error("failed to persist observed file list", "path", s.statePath, "error", err)
 	}
 }
 
-// listingURLScheme returns the scheme prefix of a Pelican object URL (e.g.
-// "osdf" for "osdf://vdc/public/pelican_protocol"). Pelican's federation
-// URLs (osdf://, pelican://, stash://) aren't meaningfully split into
-// host/path by net/url.Parse for reconstruction purposes -- e.g.
-// "osdf://vdc/public/x" parses with Host="vdc", but pelican object ls's own
-// Name field for a file under that directory is the flat absolute path
-// "/vdc/public/x/file.txt", with "vdc" already part of it -- so this just
-// grabs the literal scheme text instead.
-func listingURLScheme(listingURL string) string {
-	if scheme, _, ok := strings.Cut(listingURL, "://"); ok {
-		return scheme
+// persist writes every watched directory's currently-observed file set to
+// statePath as JSON (directory URL -> sorted file names), so a restarted
+// process resumes each directory from where it left off instead of
+// re-announcing every file already there as new.
+func (s *pelicanListingEventSource) persist() error {
+	s.mu.Lock()
+	snapshot := make(map[string][]string, len(s.seen))
+	for dir, names := range s.seen {
+		list := make([]string, 0, len(names))
+		for name := range names {
+			list = append(list, name)
+		}
+		sort.Strings(list)
+		snapshot[dir] = list
 	}
-	return "osdf"
+	s.mu.Unlock()
+
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode state: %w", err)
+	}
+	return os.WriteFile(s.statePath, data, 0o644)
 }
 
-// readFileSet reads a newline-delimited list of file names from path,
-// returning an empty set and existed=false if the file doesn't exist yet
-// (first run). existed is false only for a genuinely missing file -- one
-// that exists but is empty still counts, since that represents a previous
-// poll having confirmed the directory was empty at the time, not "no poll
-// has ever succeeded yet."
-func readFileSet(path string) (set map[string]bool, existed bool, err error) {
+// readDirectorySets reads the per-directory observed file sets persisted by
+// persist, returning an empty map if path doesn't exist yet (first run: no
+// directory has a baseline yet).
+func readDirectorySets(path string) (map[string]map[string]bool, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return map[string]bool{}, false, nil
+		return map[string]map[string]bool{}, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("read state file: %w", err)
+		return nil, fmt.Errorf("read state file: %w", err)
 	}
-	set = map[string]bool{}
-	for _, line := range strings.Split(string(data), "\n") {
-		if line != "" {
-			set[line] = true
+	var raw map[string][]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse state file %s: %w", path, err)
+	}
+	seen := make(map[string]map[string]bool, len(raw))
+	for dir, names := range raw {
+		set := make(map[string]bool, len(names))
+		for _, n := range names {
+			set[n] = true
 		}
+		seen[dir] = set
 	}
-	return set, true, nil
-}
-
-// writeFileSet persists set to path as a newline-delimited, sorted list of
-// file names -- sorted so the file's contents are deterministic and easy to
-// diff/inspect by hand, not because order matters to readFileSet.
-func writeFileSet(path string, set map[string]bool) error {
-	names := make([]string, 0, len(set))
-	for name := range set {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return os.WriteFile(path, []byte(strings.Join(names, "\n")+"\n"), 0o644)
+	return seen, nil
 }

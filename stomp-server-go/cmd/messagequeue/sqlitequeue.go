@@ -49,8 +49,7 @@ type sqliteClientQueue struct {
 	clientID string
 
 	// params is the subscription parameters this client's queue was created
-	// with (see queueFactory). Stored for future use; nothing yet
-	// interprets its contents.
+	// with (see queueFactory and Params).
 	params string
 }
 
@@ -128,3 +127,5 @@ func (q *sqliteClientQueue) Delete() error {
 	}
 	return nil
 }
+
+func (q *sqliteClientQueue) Params() string { return q.params }

@@ -257,7 +257,9 @@ func hasOwningSegment(destination, clientID string) bool {
 // contents after the client's own leading "<clientID>/" segment (already
 // verified separately by hasOwningSegment), or "" if destination has no "/"
 // at all. These are passed to queueFactory when a client's queue is first
-// created; nothing yet interprets their contents.
+// created, and exposed thereafter via clientQueue.Params -- e.g.
+// pelicanListingEventSource parses them to learn which federation directory
+// a client wants watched.
 func subscriptionParams(destination string) string {
 	if idx := strings.IndexByte(destination, '/'); idx >= 0 {
 		return destination[idx+1:]
@@ -307,6 +309,7 @@ func (a *messageQueueApp) onSubscribe(headers map[string]string) {
 	if !existed {
 		q = a.newQueue(clientID, subscriptionParams(destination))
 		a.queues[clientID] = q
+		a.source.QueueAdded(q)
 	}
 	a.clearInFlight(clientID)
 	a.mu.Unlock()
@@ -489,6 +492,7 @@ func (a *messageQueueApp) onUnsubscribe(headers map[string]string) {
 	a.mu.Unlock()
 
 	if q != nil {
+		a.source.QueueRemoved(q)
 		if err := q.Delete(); err != nil {
 			a.log.Error("queue delete failed", "subscription", clientID, "error", err)
 			a.metrics.queueErrorOccurred("delete")

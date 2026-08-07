@@ -167,6 +167,7 @@ func (brokenClientQueue) PeekFront() (string, bool, error)  { return "", false, 
 func (brokenClientQueue) PopFront() error                   { return errors.New("boom") }
 func (brokenClientQueue) Len() (int, error)                 { return 0, errors.New("boom") }
 func (brokenClientQueue) Delete() error                     { return errors.New("boom") }
+func (brokenClientQueue) Params() string                    { return "" }
 
 func TestMetrics_QueueErrorsRecordedByOperation(t *testing.T) {
 	app, srv := newTestApp(defaultMessageQueueConfig)

@@ -131,9 +131,14 @@ func (f *fakeStompServer) snapshotSentErrors() []sentError {
 // directly instead, since that avoids any timing dependency on the app's
 // background run() goroutine. ShouldNotify defaults to always-true; a test
 // that needs to exercise per-client filtering sets shouldNotify directly.
+// QueueAdded/QueueRemoved just record every call, for tests that verify
+// onSubscribe/onUnsubscribe wire them correctly.
 type fakeEventSource struct {
+	mu           sync.Mutex
 	ch           chan string
 	shouldNotify func(event string, q clientQueue) bool
+	added        []clientQueue
+	removed      []clientQueue
 }
 
 func newFakeEventSource() *fakeEventSource {
@@ -147,6 +152,30 @@ func (f *fakeEventSource) ShouldNotify(event string, q clientQueue) bool {
 		return f.shouldNotify(event, q)
 	}
 	return true
+}
+
+func (f *fakeEventSource) QueueAdded(q clientQueue) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.added = append(f.added, q)
+}
+
+func (f *fakeEventSource) QueueRemoved(q clientQueue) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, q)
+}
+
+func (f *fakeEventSource) snapshotAdded() []clientQueue {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]clientQueue{}, f.added...)
+}
+
+func (f *fakeEventSource) snapshotRemoved() []clientQueue {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]clientQueue{}, f.removed...)
 }
 
 func newTestApp(cfg messageQueueConfig) (*messageQueueApp, *fakeStompServer) {
@@ -695,6 +724,58 @@ func TestOnSubscribe_ResubscribeDoesNotRecreateQueueOrReinvokeFactory(t *testing
 
 	if calls != 1 {
 		t.Errorf("queueFactory called %d times, want 1 (only on first subscribe)", calls)
+	}
+}
+
+func TestOnSubscribe_CallsQueueAddedOnceForNewQueue(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/first", true)
+	srv.setConnected("alice/second", true)
+	source := app.source.(*fakeEventSource)
+
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/first", "ack": "client-individual"})
+	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/second", "ack": "client-individual"})
+
+	added := source.snapshotAdded()
+	if len(added) != 1 {
+		t.Fatalf("QueueAdded called %d times, want 1 (only on the first-ever subscribe for this clientID)", len(added))
+	}
+	app.mu.Lock()
+	wantQueue := app.queues["alice"]
+	app.mu.Unlock()
+	if added[0] != wantQueue {
+		t.Error("QueueAdded was called with a queue other than the one now stored for this client")
+	}
+}
+
+func TestOnUnsubscribe_CallsQueueRemoved(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	source := app.source.(*fakeEventSource)
+
+	app.onSubscribe(subscribeHeaders("alice"))
+	app.mu.Lock()
+	aliceQueue := app.queues["alice"]
+	app.mu.Unlock()
+
+	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+
+	removed := source.snapshotRemoved()
+	if len(removed) != 1 || removed[0] != aliceQueue {
+		t.Errorf("QueueRemoved calls = %v, want exactly one call with alice's queue", removed)
+	}
+}
+
+func TestOnUnsubscribe_UnknownDestinationDoesNotCallQueueRemoved(t *testing.T) {
+	app, srv := newTestApp(defaultMessageQueueConfig)
+	srv.setConnected("alice/testsource", true)
+	source := app.source.(*fakeEventSource)
+	app.onSubscribe(subscribeHeaders("alice"))
+
+	app.onUnsubscribe(map[string]string{"destination": "someone/else"})
+
+	if got := source.snapshotRemoved(); len(got) != 0 {
+		t.Errorf("QueueRemoved called for an unrelated destination: %v", got)
 	}
 }
 
