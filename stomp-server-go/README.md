@@ -97,6 +97,42 @@ watcher) doesn't have to wait for each one to reconnect first.
 | `TickerSource` | default | Emits `"Event <n>"` every 5s; not durable. |
 | `SeqFileSource` | `TEST_EVENT_SEQ_FILE=<path>` env var | Same, but persists its counter to disk so a restart doesn't repeat/reset it. |
 | `PelicanListingSource` | `--pelican-enabled` | See below. |
+| `FSNotifySource` | `--watch-dir <path>` | Emits the file path for every file created or modified under the directory tree (via fsnotify). |
+| `S3NotifySource` | `--s3-notify-addr <addr>` | Receives Ceph RadosGW bucket notifications; see below. |
+
+Exactly one of `--watch-dir` / `--s3-notify-addr` must be set; the binary
+no longer selects the ticker, seq-file or Pelican sources (they remain in the
+package).
+
+#### Ceph S3 notifications
+
+`--s3-notify-addr :8082` starts a separate, **unauthenticated** HTTP listener
+serving `POST /s3-events`. Keep it off public networks. RGW pushes JSON
+`Records` batches there; each record becomes one event, a JSON string:
+`{"event","bucket","key","size","etag","version_id","time","sequencer","event_id"}`.
+The server replies 200 only after handing every record to the queueing layer,
+so an RGW *persistent* topic redelivers while the server is down. Delivery is
+at-least-once with no server-side dedup, and an event accepted just before a
+crash but before it reaches client queues can still be lost.
+
+The server does not configure Ceph. An admin creates the topic and bucket
+notification (the `docker-compose.yml` `ceph-init` service runs exactly this,
+see `deploy/ceph/init.sh`):
+
+```sh
+aws --endpoint-url http://<rgw>:<port> sns create-topic --name s3-events \
+  --attributes '{"push-endpoint":"http://<server>:8082/s3-events","persistent":"true"}'
+aws --endpoint-url http://<rgw>:<port> s3api put-bucket-notification-configuration \
+  --bucket <bucket> --notification-configuration \
+  '{"TopicConfigurations":[{"Id":"all","TopicArn":"<arn from above>","Events":["s3:ObjectCreated:*","s3:ObjectRemoved:*"]}]}'
+```
+
+RGW needs `notifications` in `rgw_enable_apis` (on by default) and network
+access to the receiver port. The `docker-compose.yml` stack brings up a
+single-node dev Ceph (`ceph`), configures it (`ceph-init`) and uploads a
+random object every few seconds (`s3-writer`); S3 credentials, bucket and
+write interval can be overridden via `S3_ACCESS_KEY`, `S3_SECRET_KEY`,
+`S3_BUCKET`, `S3_WRITE_INTERVAL`.
 
 `PelicanListingSource` discovers which Pelican federation directories to
 watch dynamically, from each currently-tracked client queue's subscription
@@ -131,6 +167,8 @@ go build ./cmd/messagequeue
 | --- | --- | --- |
 | `--port` | `8080` | Port to listen on |
 | `--debug` | `false` | Log full frame contents (headers + body) for every STOMP frame, plus event-source poll debug logs |
+| `--watch-dir` | *(unset)* | Use the filesystem event source on this directory |
+| `--s3-notify-addr` | *(unset)* | Use the Ceph bucket-notification event source, listening on this address |
 | `--htpasswd` | *(unset)* | Path to an htpasswd file; if unset, connections are unauthenticated |
 | `--queue-db` | *(unset)* | Path to a SQLite file for durable client queues; if unset, queues are in-memory only |
 | `--pelican-enabled` | `false` | Use the Pelican directory-listing event source instead of the demo ticker |

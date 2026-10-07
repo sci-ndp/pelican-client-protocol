@@ -27,7 +27,8 @@ func main() {
 	debug := flag.Bool("debug", false, "log full frame contents (headers and body) for every frame")
 	htpasswdFile := flag.String("htpasswd", "", "path to an htpasswd file; if absent, connections are unauthenticated")
 	queueDB := flag.String("queue-db", "", "path to a SQLite database file for durable, on-disk client queues; if absent, queues are kept in memory only")
-	watchDir := flag.String("watch-dir", "", "watch this local directory tree and emit an event for every file created or modified in it (required)")
+	watchDir := flag.String("watch-dir", "", "watch this local directory tree and emit an event for every file created or modified in it (mutually exclusive with --s3-notify-addr)")
+	s3NotifyAddr := flag.String("s3-notify-addr", "", "listen address (e.g. :8082) for an unauthenticated HTTP endpoint at /s3-events that receives Ceph RadosGW bucket notifications; if set, this is the event source (mutually exclusive with --watch-dir)")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -72,16 +73,37 @@ func main() {
 		logger.Info("using in-memory client queues")
 	}
 
-	if *watchDir == "" {
-		logger.Error("--watch-dir is required")
+	var source eventsource.EventSource
+	switch {
+	case *watchDir != "" && *s3NotifyAddr != "":
+		logger.Error("--watch-dir and --s3-notify-addr are mutually exclusive")
+		os.Exit(1)
+	case *watchDir != "":
+		fsSource, err := eventsource.NewFSNotifySource(*watchDir, logger)
+		if err != nil {
+			logger.Error("failed to start filesystem watcher", "path", *watchDir, "error", err)
+			os.Exit(1)
+		}
+		source = fsSource
+		logger.Info("watching local directory for new and modified files", "path", *watchDir)
+	case *s3NotifyAddr != "":
+		s3Source := eventsource.NewS3NotifySource(logger)
+		source = s3Source
+		// A separate listener from the STOMP port, so RGW's unauthenticated
+		// pushes are never reachable through the public STOMP endpoint.
+		s3Mux := http.NewServeMux()
+		s3Mux.Handle("/s3-events", s3Source)
+		go func() {
+			logger.Info("receiving Ceph bucket notifications", "addr", *s3NotifyAddr, "path", "/s3-events")
+			if err := http.ListenAndServe(*s3NotifyAddr, s3Mux); err != nil {
+				logger.Error("S3 notification listener failed", "error", err)
+				os.Exit(1)
+			}
+		}()
+	default:
+		logger.Error("an event source is required: set --watch-dir or --s3-notify-addr")
 		os.Exit(1)
 	}
-	source, err := eventsource.NewFSNotifySource(*watchDir, logger)
-	if err != nil {
-		logger.Error("failed to start filesystem watcher", "path", *watchDir, "error", err)
-		os.Exit(1)
-	}
-	logger.Info("watching local directory for new and modified files", "path", *watchDir)
 
 	srv := stomp.NewServer(logger)
 	app := messagequeue.New(srv, logger, source, newQueue)

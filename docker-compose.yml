@@ -4,25 +4,79 @@ services:
     # QUEUE_DB is opt-in: leave it unset for the default in-memory queue.
     # --queue-db is a CLI flag rather than an env var on the server binary, so
     # this wraps the command in a shell to only pass it when QUEUE_DB is set.
-    # WATCH_DIR selects the event source: the filesystem watcher emits an
-    # event for every file created or modified under that directory (here the
-    # event-data volume, mounted at /mnt/data).
+    # The event source is Ceph RGW bucket notifications: RGW POSTs them,
+    # unauthenticated, to :8082/s3-events. That port is deliberately not
+    # published to the host; RGW reaches it over the compose network (see
+    # ceph-init, which points the topic's push-endpoint here).
     command: >
-      sh -c 'exec stomp-server-go --port 8080 --watch-dir "$$WATCH_DIR" $${QUEUE_DB:+--queue-db "$$QUEUE_DB"}'
+      sh -c 'exec stomp-server-go --port 8080 --s3-notify-addr :8082 $${QUEUE_DB:+--queue-db "$$QUEUE_DB"}'
     environment:
       QUEUE_DB: /etc/data/queue.sqlite
-      WATCH_DIR: /mnt/data
     ports:
       - "8080:8080"
     volumes:
       - db-data:/etc/data
-      - event-data:/mnt/data
+
+  # Single-node dev Ceph (mon+mgr+osd+rgw in one container). Not for
+  # production; data is not persisted across `down`. RGW listens on 8080
+  # inside the container, published on 7480 (RGW's usual port) since 8080
+  # is the STOMP server's.
+  ceph:
+    image: quay.io/ceph/demo:latest-squid
+    entrypoint: ["sh", "-c", "export MON_IP=$$(hostname -i | cut -d' ' -f1); exec /opt/ceph-container/bin/demo"]
+    environment:
+      CEPH_PUBLIC_NETWORK: 0.0.0.0/0
+      DEMO_DAEMONS: osd,rgw
+      RGW_NAME: ceph
+      CEPH_DEMO_UID: demo
+      CEPH_DEMO_ACCESS_KEY: ${S3_ACCESS_KEY:-demoaccesskey}
+      CEPH_DEMO_SECRET_KEY: ${S3_SECRET_KEY:-demosecretkey}
+      CEPH_DEMO_BUCKET: ${S3_BUCKET:-events}
+    ports:
+      - "7480:8080"
+    healthcheck:
+      # Probe the container IP: on localhost :8080 something else answers 404.
+      test: ["CMD-SHELL", "curl -sf http://$$(hostname -i | cut -d' ' -f1):8080 >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  # One-shot: wires the bucket to the server via a persistent RGW topic.
+  ceph-init:
+    image: amazon/aws-cli:latest
+    entrypoint: ["sh", "/init.sh"]
+    restart: "no"
+    environment: &s3-env
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-demoaccesskey}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-demosecretkey}
+      AWS_DEFAULT_REGION: default
+      BUCKET: ${S3_BUCKET:-events}
+      S3_ENDPOINT: http://ceph:8080
+    volumes:
+      - ./deploy/ceph/init.sh:/init.sh:ro
+    depends_on:
+      ceph:
+        condition: service_healthy
+
+  # Test traffic: uploads a small object to the bucket every few seconds.
+  s3-writer:
+    image: amazon/aws-cli:latest
+    entrypoint: ["sh", "/writer.sh"]
+    environment:
+      <<: *s3-env
+      WRITE_INTERVAL: ${S3_WRITE_INTERVAL:-5}
+    volumes:
+      - ./deploy/ceph/writer.sh:/writer.sh:ro
+    depends_on:
+      ceph-init:
+        condition: service_completed_successfully
 
   client:
     build: ./stomp-client
     # --event-source becomes this client's subscription parameters (the
-    # suffix of its destination, <client_id>/<event-source>). The filesystem
-    # watcher ignores it, so every client receives every event.
+    # suffix of its destination, <client_id>/<event-source>). The
+    # S3 notification source ignores it, so every client receives every event.
     command: python client.py --event-source osdf/vdc/public/pelican_protocol --client-id playground-client --reconnect --log-level ${LOG_LEVEL:-INFO}
     environment:
       STOMP_URL: ws://server:8080
@@ -35,19 +89,7 @@ services:
       - "8081:8081"
     depends_on:
       - server
-
-  generator:
-    build: ./event-generator
-    #command: python generator.py --destination /origin/demo --rate 2
-    command: sleep infinity
-    environment:
-      STOMP_URL: ws://server:8080
-      CONTROL_PORT: 8090
-    ports:
-      - "8090:8090"
-    depends_on:
-      - server
-
+      
   web-ui:
     build: ./web-ui
     ports:
@@ -63,4 +105,3 @@ services:
       - server
 volumes:
   db-data:
-  event-data:
