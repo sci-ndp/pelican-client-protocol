@@ -5,15 +5,12 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"time"
 
 	"stomp-server-go/internal/clientqueue"
 	"stomp-server-go/internal/eventsource"
 	"stomp-server-go/internal/messagequeue"
 	"stomp-server-go/internal/stomp"
 )
-
-const eventInterval = 5 * time.Second
 
 // allowCORS lets any origin GET the wrapped handler's response, for
 // endpoints (like /metrics) that are read-only, unauthenticated, and meant
@@ -30,10 +27,7 @@ func main() {
 	debug := flag.Bool("debug", false, "log full frame contents (headers and body) for every frame")
 	htpasswdFile := flag.String("htpasswd", "", "path to an htpasswd file; if absent, connections are unauthenticated")
 	queueDB := flag.String("queue-db", "", "path to a SQLite database file for durable, on-disk client queues; if absent, queues are kept in memory only")
-	pelicanEnabled := flag.Bool("pelican-enabled", false, "watch Pelican federation directories named by clients' own subscription parameters for new files; if set, this is the event source instead of the demo ticker")
-	pelicanPollInterval := flag.Duration("pelican-poll-interval", time.Minute, "how often to poll watched Pelican directories")
-	pelicanStateFile := flag.String("pelican-state-file", "", "path to a file recording each watched directory's last-observed listing, so a restart doesn't re-announce every existing file as new (required if --pelican-enabled is set)")
-	pelicanBinary := flag.String("pelican-binary", "pelican", "path to the pelican CLI binary used to list watched directories")
+	watchDir := flag.String("watch-dir", "", "watch this local directory tree and emit an event for every file created or modified in it (required)")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -78,38 +72,16 @@ func main() {
 		logger.Info("using in-memory client queues")
 	}
 
-	// Exactly one event source is ever active: the Pelican directory watcher
-	// if --pelican-enabled is set, else the persistent file-backed demo
-	// source if TEST_EVENT_SEQ_FILE is set, else the plain in-memory demo
-	// ticker. The Pelican watcher doesn't take a fixed directory: it derives
-	// what to watch dynamically from each client's own subscription
-	// parameters (see pelicanDirectoryFromParams), via QueueAdded/
-	// QueueRemoved hooks messagequeue.App calls as clients (un)subscribe.
-	var source eventsource.EventSource
-	if *pelicanEnabled {
-		if *pelicanStateFile == "" {
-			logger.Error("--pelican-state-file is required when --pelican-enabled is set")
-			os.Exit(1)
-		}
-		pelicanSource, err := eventsource.NewPelicanListingSource(*pelicanPollInterval, *pelicanStateFile, *pelicanBinary, logger)
-		if err != nil {
-			logger.Error("failed to start Pelican directory listing watcher", "error", err)
-			os.Exit(1)
-		}
-		source = pelicanSource
-		logger.Info("watching Pelican directories named by client subscription parameters", "poll-interval", *pelicanPollInterval, "state-file", *pelicanStateFile)
-	} else if seqFile := os.Getenv("TEST_EVENT_SEQ_FILE"); seqFile != "" {
-		seqSource, err := eventsource.NewSeqFileSource(seqFile, eventInterval, logger)
-		if err != nil {
-			logger.Error("failed to start persistent sequence event source", "path", seqFile, "error", err)
-			os.Exit(1)
-		}
-		source = seqSource
-		logger.Info("using persistent sequence event source", "TEST_EVENT_SEQ_FILE", seqFile)
-	} else {
-		source = eventsource.NewTickerSource(eventInterval)
-		logger.Info("using in-memory demo ticker event source")
+	if *watchDir == "" {
+		logger.Error("--watch-dir is required")
+		os.Exit(1)
 	}
+	source, err := eventsource.NewFSNotifySource(*watchDir, logger)
+	if err != nil {
+		logger.Error("failed to start filesystem watcher", "path", *watchDir, "error", err)
+		os.Exit(1)
+	}
+	logger.Info("watching local directory for new and modified files", "path", *watchDir)
 
 	srv := stomp.NewServer(logger)
 	app := messagequeue.New(srv, logger, source, newQueue)
