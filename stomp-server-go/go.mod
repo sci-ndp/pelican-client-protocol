@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-stomp/stomp/v3 v3.1.5
 	github.com/prometheus/client_golang v1.24.1
 	golang.org/x/crypto v0.45.0
