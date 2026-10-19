@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"os"
 
-	"stomp-server-go/internal/stomp"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
 func main() {

@@ -7,23 +7,12 @@ import (
 	"os"
 	"time"
 
-	"stomp-server-go/internal/clientqueue"
-	"stomp-server-go/internal/eventsource"
-	"stomp-server-go/internal/messagequeue"
-	"stomp-server-go/internal/stomp"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/eventsource"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/sources"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/notificationserver"
 )
 
 const eventInterval = 5 * time.Second
-
-// allowCORS lets any origin GET the wrapped handler's response, for
-// endpoints (like /metrics) that are read-only, unauthenticated, and meant
-// to be polled from a dashboard served on a different origin/port.
-func allowCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		next.ServeHTTP(w, r)
-	})
-}
 
 func main() {
 	port := flag.String("port", "8080", "port to listen on")
@@ -42,42 +31,6 @@ func main() {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
-	var authenticator stomp.Authenticator = stomp.NoAuth{}
-	if *htpasswdFile != "" {
-		a, err := stomp.NewBasicAuth(*htpasswdFile, logger)
-		if err != nil {
-			logger.Error("failed to load htpasswd file", "error", err)
-			os.Exit(1)
-		}
-		authenticator = a
-	}
-
-	addr := ":" + *port
-	listener := stomp.NewWSListener(stomp.SimpleAddr(addr))
-
-	mux := http.NewServeMux()
-	mux.Handle("/", stomp.RequireAuth(authenticator, listener))
-
-	newQueue := clientqueue.Factory(clientqueue.NewMemoryQueue)
-	var persistedClients []clientqueue.PersistedClient
-	if *queueDB != "" {
-		db, err := clientqueue.OpenDB(*queueDB)
-		if err != nil {
-			logger.Error("failed to open queue database", "error", err)
-			os.Exit(1)
-		}
-		newQueue = clientqueue.SQLiteFactory(db, logger)
-		logger.Info("using on-disk client queues", "queue-db", *queueDB)
-
-		persistedClients, err = clientqueue.ListPersistedClients(db)
-		if err != nil {
-			logger.Error("failed to list persisted clients", "error", err)
-			os.Exit(1)
-		}
-	} else {
-		logger.Info("using in-memory client queues")
-	}
-
 	// Exactly one event source is ever active: the Pelican directory watcher
 	// if --pelican-enabled is set, else the persistent file-backed demo
 	// source if TEST_EVENT_SEQ_FILE is set, else the plain in-memory demo
@@ -91,7 +44,7 @@ func main() {
 			logger.Error("--pelican-state-file is required when --pelican-enabled is set")
 			os.Exit(1)
 		}
-		pelicanSource, err := eventsource.NewPelicanListingSource(*pelicanPollInterval, *pelicanStateFile, *pelicanBinary, logger)
+		pelicanSource, err := sources.NewPelicanListingSource(*pelicanPollInterval, *pelicanStateFile, *pelicanBinary, logger)
 		if err != nil {
 			logger.Error("failed to start Pelican directory listing watcher", "error", err)
 			os.Exit(1)
@@ -99,7 +52,7 @@ func main() {
 		source = pelicanSource
 		logger.Info("watching Pelican directories named by client subscription parameters", "poll-interval", *pelicanPollInterval, "state-file", *pelicanStateFile)
 	} else if seqFile := os.Getenv("TEST_EVENT_SEQ_FILE"); seqFile != "" {
-		seqSource, err := eventsource.NewSeqFileSource(seqFile, eventInterval, logger)
+		seqSource, err := sources.NewSeqFileSource(seqFile, eventInterval, logger)
 		if err != nil {
 			logger.Error("failed to start persistent sequence event source", "path", seqFile, "error", err)
 			os.Exit(1)
@@ -107,33 +60,25 @@ func main() {
 		source = seqSource
 		logger.Info("using persistent sequence event source", "TEST_EVENT_SEQ_FILE", seqFile)
 	} else {
-		source = eventsource.NewTickerSource(eventInterval)
+		source = sources.NewTickerSource(eventInterval)
 		logger.Info("using in-memory demo ticker event source")
 	}
 
-	srv := stomp.NewServer(logger)
-	app := messagequeue.New(srv, logger, source, newQueue)
-	// Pre-populate queues (and notify source) for durable clients from a
-	// prior process run, before serving any connections -- otherwise e.g.
-	// the Pelican watcher wouldn't know to watch their directories until
-	// each one happens to reconnect.
-	app.RehydrateQueues(persistedClients)
-	// Dashboards (e.g. server-ui) are typically served from a different
-	// origin than this server, so allow cross-origin GETs of this read-only,
-	// non-sensitive endpoint.
-	mux.Handle("/metrics", allowCORS(app.MetricsHandler()))
+	handler, err := notificationserver.New(notificationserver.NotificationServerArgs{
+		EventSource:  source,
+		Logger:       logger,
+		HtpasswdFile: *htpasswdFile,
+		QueueDB:      *queueDB,
+	})
+	if err != nil {
+		logger.Error("failed to start notification server", "error", err)
+		os.Exit(1)
+	}
 
-	httpServer := &http.Server{Addr: addr, Handler: mux}
-	go func() {
-		logger.Info("STOMP 1.2 WebSocket server listening", "addr", "ws://0.0.0.0"+addr)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("http server failed", "error", err)
-			os.Exit(1)
-		}
-	}()
-
-	if err := srv.Serve(listener); err != nil {
-		logger.Error("stomp server failed", "error", err)
+	addr := ":" + *port
+	logger.Info("STOMP 1.2 WebSocket server listening", "addr", "ws://0.0.0.0"+addr)
+	if err := http.ListenAndServe(addr, handler); err != nil {
+		logger.Error("http server failed", "error", err)
 		os.Exit(1)
 	}
 }

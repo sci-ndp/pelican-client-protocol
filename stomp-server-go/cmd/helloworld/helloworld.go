@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"stomp-server-go/internal/stomp"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
 // helloWorldApp is a small application layer built entirely on the

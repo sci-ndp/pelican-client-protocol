@@ -3,6 +3,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
+COPY clientqueue ./clientqueue
+COPY eventsource ./eventsource
+COPY notificationserver ./notificationserver
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -o /out/stomp-server-go ./cmd/messagequeue
 

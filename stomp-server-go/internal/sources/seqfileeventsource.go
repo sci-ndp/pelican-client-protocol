@@ -1,7 +1,8 @@
-package eventsource
+package sources
 
 import (
 	"fmt"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/eventsource"
 	"log/slog"
 	"os"
 	"strconv"
@@ -14,7 +15,7 @@ import (
 // re-written to path after every increment, so a restarted process resumes
 // counting up from where it left off instead of starting over at 1.
 type SeqFileSource struct {
-	defaultNotifier
+	eventsource.DefaultNotifier
 	path string
 	log  *slog.Logger
 	ch   chan string

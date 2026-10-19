@@ -1,4 +1,4 @@
-module stomp-server-go
+module github.com/sci-ndp/pelican-client-protocol/stomp-server-go
 
 go 1.26.2
 

@@ -10,7 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"stomp-server-go/internal/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
 )
 
 func TestMetrics_SubscribeAcceptedAndRejected(t *testing.T) {

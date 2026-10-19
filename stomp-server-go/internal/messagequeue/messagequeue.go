@@ -13,9 +13,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"stomp-server-go/internal/clientqueue"
-	"stomp-server-go/internal/eventsource"
-	"stomp-server-go/internal/stomp"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/eventsource"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
 const (
