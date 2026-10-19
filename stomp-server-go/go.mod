@@ -8,10 +8,10 @@ require (
 )
 
 require (
+	github.com/glebarez/go-sqlite v1.23.0
 	github.com/go-stomp/stomp/v3 v3.1.5
 	github.com/prometheus/client_golang v1.24.1
 	golang.org/x/crypto v0.45.0
-	modernc.org/sqlite v1.56.0
 )
 
 require (
@@ -31,4 +31,5 @@ require (
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
+	modernc.org/sqlite v1.56.0 // indirect
 )
