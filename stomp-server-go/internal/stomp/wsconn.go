@@ -78,3 +78,7 @@ func (c *wsConn) SetDeadline(t time.Time) error {
 
 func (c *wsConn) SetReadDeadline(t time.Time) error  { return c.ws.SetReadDeadline(t) }
 func (c *wsConn) SetWriteDeadline(t time.Time) error { return c.ws.SetWriteDeadline(t) }
+
+// NewWSConn exports newWSConn for clients outside this package, such as
+// cmd/listener, that dial the server themselves.
+func NewWSConn(ws *websocket.Conn) net.Conn { return newWSConn(ws) }
