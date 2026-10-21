@@ -38,6 +38,7 @@ type sentError struct {
 // what Connected reports, all without any real network I/O.
 type fakeStompServer struct {
 	mu               sync.Mutex
+	validators       []func(map[string]string) error
 	onSubscribeFns   []func(map[string]string)
 	onUnsubscribeFns []func(map[string]string)
 	onAckFns         []func(map[string]string)
@@ -57,6 +58,12 @@ func (f *fakeStompServer) Publish(destination string, messageID string, body any
 	defer f.mu.Unlock()
 	f.publishes = append(f.publishes, publishCall{destination: destination, messageID: messageID, body: body.(string)})
 	return nil
+}
+
+func (f *fakeStompServer) ValidateSubscribe(fn func(headers map[string]string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validators = append(f.validators, fn)
 }
 
 func (f *fakeStompServer) OnSubscribe(fn func(headers map[string]string)) {
@@ -1243,4 +1250,25 @@ func TestOnSubscribe_ReconnectWithoutRestartDoesNotDoubleCountGauge(t *testing.T
 	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 1 {
 		t.Errorf("queuedEvents after in-process reconnect = %v, want still 1 (must not double-count)", got)
 	}
+}
+
+func TestValidateSubscribe_RejectsDestinationNotOwnedByClient(t *testing.T) {
+	app, srv := newTestApp(defaultConfig)
+	srv.mu.Lock()
+	validate := srv.validators[0]
+	srv.mu.Unlock()
+
+	if err := validate(map[string]string{"subscription": "alice", "destination": "bob/x"}); err == nil {
+		t.Error("expected a rejection for a destination owned by another client")
+	}
+	if err := validate(map[string]string{"subscription": "alice", "destination": "aliceX/x"}); err == nil {
+		t.Error("expected a rejection for a destination whose first segment is not exactly the client's id")
+	}
+	if err := validate(map[string]string{"subscription": "", "destination": "alice/x"}); err == nil {
+		t.Error("expected a rejection for a missing subscription header")
+	}
+	if err := validate(map[string]string{"subscription": "alice", "destination": "alice/x"}); err != nil {
+		t.Errorf("owned destination rejected: %v", err)
+	}
+	_ = app
 }

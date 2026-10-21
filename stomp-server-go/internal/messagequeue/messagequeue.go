@@ -4,6 +4,7 @@
 package messagequeue
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -100,6 +101,7 @@ func NewWithConfig(srv stomp.StompServer, log *slog.Logger, source eventsource.E
 		clientIDs:    map[string]string{},
 	}
 	a.metrics = newAppMetrics(a)
+	srv.ValidateSubscribe(a.validateSubscribe)
 	srv.OnSubscribe(a.onSubscribe)
 	srv.OnUnsubscribe(a.onUnsubscribe)
 	srv.OnAck(a.onAck)
@@ -303,6 +305,28 @@ func subscriptionParams(destination string) string {
 	return ""
 }
 
+// validateSubscribe vets a SUBSCRIBE's headers, logging and counting a
+// rejection. It is registered with the STOMP server so a bad SUBSCRIBE is
+// answered with an ERROR frame and a closed connection before it takes
+// effect; onSubscribe repeats the check so it holds even when driven
+// directly.
+func (a *App) validateSubscribe(headers map[string]string) error {
+	clientID := headers["subscription"]
+	destination := headers["destination"]
+	if clientID == "" || destination == "" {
+		a.log.Warn("SUBSCRIBE missing subscription/destination header; rejecting", "headers", headers)
+		a.metrics.subscribeRejected("missing_headers")
+		return errors.New("SUBSCRIBE requires subscription and destination headers")
+	}
+	if !hasOwningSegment(destination, clientID) {
+		a.log.Warn("SUBSCRIBE destination does not start with the client's own subscription id; rejecting",
+			"subscription", clientID, "destination", destination)
+		a.metrics.subscribeRejected("wrong_owner")
+		return fmt.Errorf("destination %q must start with your own subscription id %q", destination, clientID)
+	}
+	return nil
+}
+
 // onSubscribe creates a new event queue the first time a client's
 // `subscription` header is seen, or resumes the existing one if it matches a
 // queue kept around from an earlier connection made with the same
@@ -325,19 +349,11 @@ func subscriptionParams(destination string) string {
 // subscriptionParams), so one client can never subscribe to a destination
 // namespaced under a different client's id.
 func (a *App) onSubscribe(headers map[string]string) {
+	if a.validateSubscribe(headers) != nil {
+		return
+	}
 	clientID := headers["subscription"]
 	destination := headers["destination"]
-	if clientID == "" || destination == "" {
-		a.log.Warn("SUBSCRIBE missing subscription/destination header; ignoring", "headers", headers)
-		a.metrics.subscribeRejected("missing_headers")
-		return
-	}
-	if !hasOwningSegment(destination, clientID) {
-		a.log.Warn("SUBSCRIBE destination does not start with the client's own subscription id; ignoring",
-			"subscription", clientID, "destination", destination)
-		a.metrics.subscribeRejected("wrong_owner")
-		return
-	}
 	if ack := headers["ack"]; ack != "client-individual" {
 		a.log.Warn("client subscribed without ack:client-individual; retries won't work correctly",
 			"subscription", clientID, "ack", ack)

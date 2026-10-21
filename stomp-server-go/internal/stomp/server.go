@@ -86,6 +86,7 @@ type Server struct {
 	sessions      map[net.Conn]*session
 	subscriptions map[string]map[net.Conn]bool // destination -> set of subscribed conns
 	log           *slog.Logger
+	validators    []func(headers map[string]string) error
 	onSubscribe   []func(headers map[string]string)
 	onUnsubscribe []func(headers map[string]string)
 	onAck         []func(headers map[string]string)
@@ -109,6 +110,15 @@ type StompServer interface {
 	// currently subscribed to destination. If messageID is empty, one is
 	// generated.
 	Publish(destination string, messageID string, body any) error
+
+	// ValidateSubscribe registers fn to vet every SUBSCRIBE before it takes
+	// effect, with the full SUBSCRIBE frame's headers. If fn returns an
+	// error, the subscription is never registered (no OnSubscribe callbacks
+	// fire), an ERROR frame carrying the error's message is sent to that
+	// client, and its connection is closed. fn runs synchronously on the
+	// connection's own goroutine, so (like OnSubscribe) it must not block
+	// or call back into the server.
+	ValidateSubscribe(fn func(headers map[string]string) error)
 
 	// OnSubscribe registers fn to be called after every successful
 	// SUBSCRIBE, with the full SUBSCRIBE frame's headers (destination, id,
@@ -169,6 +179,13 @@ type StompServer interface {
 }
 
 var _ StompServer = (*Server)(nil)
+
+// ValidateSubscribe implements StompServer.
+func (s *Server) ValidateSubscribe(fn func(headers map[string]string) error) {
+	s.mu.Lock()
+	s.validators = append(s.validators, fn)
+	s.mu.Unlock()
+}
 
 // OnSubscribe implements StompServer.
 func (s *Server) OnSubscribe(fn func(headers map[string]string)) {
@@ -350,6 +367,12 @@ func (s *Server) handleConn(conn net.Conn) {
 			if err := s.dispatch(sess, frame); err != nil {
 				s.log.Error("command failed", "error", err)
 				s.send(sess, NewFrame("ERROR", map[string]string{"message": err.Error()}, err.Error()))
+				var fatal *fatalError
+				if errors.As(err, &fatal) {
+					// Per STOMP, the server closes the connection after
+					// sending an ERROR frame; the defer above does so.
+					return
+				}
 			}
 		}
 	}
@@ -392,6 +415,13 @@ func (s *Server) dispatch(sess *session, frame *Frame) error {
 	}
 }
 
+// fatalError wraps an error that, after being reported to the client in an
+// ERROR frame, must also end its connection.
+type fatalError struct{ err error }
+
+func (e *fatalError) Error() string { return e.err.Error() }
+func (e *fatalError) Unwrap() error { return e.err }
+
 func (s *Server) handleConnect(sess *session, frame *Frame) error {
 	return s.send(sess, NewFrame("CONNECTED", map[string]string{
 		"version": "1.2",
@@ -412,6 +442,15 @@ func (s *Server) handleSubscribe(sess *session, frame *Frame) error {
 	}
 	if ackMode != ackAuto && ackMode != ackClient && ackMode != ackClientIndividual {
 		return protocolErrorf("unsupported ack mode: %s", ackMode)
+	}
+
+	s.mu.Lock()
+	validators := append([]func(map[string]string) error{}, s.validators...)
+	s.mu.Unlock()
+	for _, validate := range validators {
+		if err := validate(frame.Headers); err != nil {
+			return &fatalError{err}
+		}
 	}
 
 	s.mu.Lock()

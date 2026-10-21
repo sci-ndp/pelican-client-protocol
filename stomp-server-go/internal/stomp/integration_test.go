@@ -2,10 +2,12 @@ package stomp
 
 import (
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -745,4 +747,41 @@ func TestIntegration_ConnectedReflectsSubscriptionState(t *testing.T) {
 		t.Fatalf("Disconnect: %v", err)
 	}
 	waitDisconnected(t, srv, "/topic/test")
+}
+
+func TestIntegration_ValidateSubscribeRejectionSendsErrorAndClosesConnection(t *testing.T) {
+	wsURL, srv := startTestServer(t, NoAuth{})
+	srv.ValidateSubscribe(func(headers map[string]string) error {
+		return errors.New("not yours")
+	})
+	var subscribed atomic.Bool
+	srv.OnSubscribe(func(map[string]string) { subscribed.Store(true) })
+	conn := dialStompClient(t, wsURL, nil)
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	select {
+	case msg := <-sub.C:
+		if msg == nil || msg.Err == nil || msg.Err.Error() != "not yours" {
+			t.Fatalf("got %+v, want an ERROR frame with message %q", msg, "not yours")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the ERROR frame")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := <-sub.C; !ok {
+			break // channel closed: the connection is gone
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connection was not closed after the ERROR frame")
+		}
+	}
+	if subscribed.Load() || srv.Connected("/topic/test") {
+		t.Error("rejected SUBSCRIBE still took effect")
+	}
 }
