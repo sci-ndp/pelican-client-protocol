@@ -11,14 +11,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
 func TestMetrics_SubscribeAcceptedAndRejected(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 
-	app.onSubscribe(subscribeHeaders("alice"))                                                                        // accepted
-	app.onSubscribe(map[string]string{"subscription": "", "destination": "", "ack": "client-individual"})             // missing headers
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "bob/foo", "ack": "client-individual"}) // wrong owner
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))                                                                        // accepted
+	app.onSubscribe(stomp.Principal{}, map[string]string{"subscription": "", "destination": "", "ack": "client-individual"})             // missing headers
+	app.onSubscribe(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "bob/foo", "ack": "client-individual"}) // wrong owner
 
 	if got := testutil.ToFloat64(app.metrics.subscriptions.WithLabelValues("accepted")); got != 1 {
 		t.Errorf("subscriptions{outcome=accepted} = %v, want 1", got)
@@ -40,7 +41,7 @@ func TestMetrics_QueueLifecycleCountersAndGauges(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1")
 	app.onEvent("Event 2") // queued behind the in-flight delivery of Event 1
 
@@ -59,7 +60,7 @@ func TestMetrics_QueueLifecycleCountersAndGauges(t *testing.T) {
 		t.Fatalf("Publish calls = %d, want 1", len(publishes))
 	}
 	time.Sleep(2 * time.Millisecond) // ensure a nonzero ack latency to observe
-	app.onAck(map[string]string{"destination": "alice/testsource", "message-id": publishes[0].messageID})
+	app.onAck(stomp.Principal{}, map[string]string{"destination": "alice/testsource", "message-id": publishes[0].messageID})
 
 	if got := testutil.ToFloat64(app.metrics.acks); got != 1 {
 		t.Errorf("acks = %v, want 1", got)
@@ -94,7 +95,7 @@ func TestMetrics_QueueOverflowWhileConnectedRecordsOverflowAndDisconnect(t *test
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	for _, e := range []string{"E1", "E2", "E3", "E4"} {
 		app.onEvent(e)
 	}
@@ -113,7 +114,7 @@ func TestMetrics_QueueOverflowWhileOfflineDoesNotDisconnect(t *testing.T) {
 	app, srv := newTestApp(cfg)
 
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	srv.setConnected("alice/testsource", false)
 
 	for _, e := range []string{"E1", "E2", "E3", "E4"} {
@@ -138,7 +139,7 @@ func TestMetrics_RetryExhaustionRecordsRetriesAndDisconnect(t *testing.T) {
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1") // delivered, then never acked
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -176,7 +177,7 @@ func TestMetrics_QueueErrorsRecordedByOperation(t *testing.T) {
 	app.newQueue = func(string, string) clientqueue.Queue { return brokenClientQueue{} }
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice")) // Len() fails during onSubscribe's resume check
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice")) // Len() fails during onSubscribe's resume check
 	if got := testutil.ToFloat64(app.metrics.queueErrors.WithLabelValues("len")); got != 1 {
 		t.Errorf(`queueErrors{operation="len"} = %v, want 1`, got)
 	}
@@ -190,7 +191,7 @@ func TestMetrics_QueueErrorsRecordedByOperation(t *testing.T) {
 func TestMetrics_HandlerServesPrometheusExpositionFormat(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1")
 
 	rr := httptest.NewRecorder()

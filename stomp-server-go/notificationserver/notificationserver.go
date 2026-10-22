@@ -16,6 +16,38 @@ import (
 	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
+// Principal, Authenticator, Authorizer and their stock implementations are
+// re-exported from the internal STOMP package so library users can implement
+// and configure access control without importing it.
+type (
+	// Principal identifies who an Authenticator admitted; it is passed to the
+	// Authorizer on every subscription. The zero value is anonymous.
+	Principal = stomp.Principal
+
+	// Authenticator decides whether an HTTP request may proceed to the
+	// WebSocket upgrade, and who it is from. See stomp.Authenticator.
+	Authenticator = stomp.Authenticator
+
+	// Authorizer decides whether a Principal may subscribe to a destination.
+	Authorizer = stomp.Authorizer
+
+	// NoAuth is an Authenticator that admits every request anonymously.
+	NoAuth = stomp.NoAuth
+
+	// AllowAll is an Authorizer that permits every subscription.
+	AllowAll = stomp.AllowAll
+)
+
+// NewBasicAuth returns an Authenticator backed by a bcrypt htpasswd file,
+// checked via HTTP Basic auth.
+func NewBasicAuth(htpasswdPath string, log *slog.Logger) (Authenticator, error) {
+	a, err := stomp.NewBasicAuth(htpasswdPath, log)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
 // NotificationServerArgs configures New.
 type NotificationServerArgs struct {
 	// EventSource produces the events fanned out to clients. Required.
@@ -24,9 +56,16 @@ type NotificationServerArgs struct {
 	// Logger receives all server logs. If nil, slog.Default() is used.
 	Logger *slog.Logger
 
-	// HtpasswdFile is the path to an htpasswd file used for HTTP basic auth
-	// on the WebSocket endpoint. If empty, connections are unauthenticated.
-	HtpasswdFile string
+	// Authenticator checks every request to the WebSocket endpoint and
+	// identifies the caller. If nil, connections are unauthenticated
+	// (NoAuth). See NewBasicAuth for an htpasswd-backed implementation.
+	Authenticator Authenticator
+
+	// Authorizer is consulted on every SUBSCRIBE with the connection's
+	// authenticated Principal and the requested destination; returning false
+	// rejects the subscription with an ERROR frame and closes the
+	// connection. If nil, every subscription is allowed (AllowAll).
+	Authorizer Authorizer
 
 	// QueueDB is the path to a SQLite database file for durable, on-disk
 	// client queues; clients persisted by a prior run are rehydrated at
@@ -60,13 +99,13 @@ func New(args NotificationServerArgs) (http.Handler, error) {
 		logger = slog.Default()
 	}
 
-	var authenticator stomp.Authenticator = stomp.NoAuth{}
-	if args.HtpasswdFile != "" {
-		a, err := stomp.NewBasicAuth(args.HtpasswdFile, logger)
-		if err != nil {
-			return nil, fmt.Errorf("load htpasswd file: %w", err)
-		}
-		authenticator = a
+	authenticator := args.Authenticator
+	if authenticator == nil {
+		authenticator = NoAuth{}
+	}
+	authorizer := args.Authorizer
+	if authorizer == nil {
+		authorizer = AllowAll{}
 	}
 
 	newQueue := args.QueueFactory
@@ -91,7 +130,7 @@ func New(args NotificationServerArgs) (http.Handler, error) {
 
 	listener := stomp.NewWSListener(stomp.SimpleAddr("notificationserver"))
 	srv := stomp.NewServer(logger)
-	app := messagequeue.New(srv, logger, args.EventSource, newQueue)
+	app := messagequeue.New(srv, logger, args.EventSource, newQueue, messagequeue.WithAuthorizer(authorizer))
 	// Pre-populate queues (and notify the source) for durable clients from a
 	// prior process run, before serving any connections.
 	app.RehydrateQueues(persistedClients)

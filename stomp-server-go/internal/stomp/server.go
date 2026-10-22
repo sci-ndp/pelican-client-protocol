@@ -45,6 +45,7 @@ type subscription struct {
 // ack id to the subscription it belongs to.
 type session struct {
 	conn          net.Conn
+	principal     Principal  // who the HTTP upgrade authenticated; fixed for the connection's life
 	writeMu       sync.Mutex // serializes writes to conn (gorilla/websocket allows only one concurrent writer)
 	subscriptions map[string]*subscription
 	ackIndex      map[string]string // ack id -> subscription id
@@ -59,8 +60,13 @@ type session struct {
 }
 
 func newSession(conn net.Conn) *session {
+	var p Principal
+	if pc, ok := conn.(interface{ Principal() Principal }); ok {
+		p = pc.Principal()
+	}
 	return &session{
 		conn:           conn,
+		principal:      p,
 		subscriptions:  map[string]*subscription{},
 		ackIndex:       map[string]string{},
 		everSubscribed: map[string]bool{},
@@ -86,11 +92,11 @@ type Server struct {
 	sessions      map[net.Conn]*session
 	subscriptions map[string]map[net.Conn]bool // destination -> set of subscribed conns
 	log           *slog.Logger
-	validators    []func(headers map[string]string) error
-	onSubscribe   []func(headers map[string]string)
-	onUnsubscribe []func(headers map[string]string)
-	onAck         []func(headers map[string]string)
-	onDisconnect  []func(headers map[string]string)
+	validators    []func(p Principal, headers map[string]string) error
+	onSubscribe   []func(p Principal, headers map[string]string)
+	onUnsubscribe []func(p Principal, headers map[string]string)
+	onAck         []func(p Principal, headers map[string]string)
+	onDisconnect  []func(p Principal, headers map[string]string)
 }
 
 func NewServer(log *slog.Logger) *Server {
@@ -103,7 +109,10 @@ func NewServer(log *slog.Logger) *Server {
 
 // StompServer is the surface an application layer built on top of this
 // STOMP server is allowed to depend on: publishing to a destination, and
-// reacting to subscriptions. It exists so that code like helloworld.go
+// reacting to subscriptions. Every callback receives the Principal the
+// connection's HTTP upgrade was authenticated as (the anonymous Principal
+// if the listener wasn't fed through RequireAuth), so e.g. a
+// ValidateSubscribe fn can authorize a destination per caller. It exists so that code like helloworld.go
 // never reaches into Server's internal session/subscription bookkeeping.
 type StompServer interface {
 	// Publish delivers body, JSON-encoded, as a MESSAGE to every session
@@ -118,7 +127,7 @@ type StompServer interface {
 	// client, and its connection is closed. fn runs synchronously on the
 	// connection's own goroutine, so (like OnSubscribe) it must not block
 	// or call back into the server.
-	ValidateSubscribe(fn func(headers map[string]string) error)
+	ValidateSubscribe(fn func(p Principal, headers map[string]string) error)
 
 	// OnSubscribe registers fn to be called after every successful
 	// SUBSCRIBE, with the full SUBSCRIBE frame's headers (destination, id,
@@ -126,7 +135,7 @@ type StompServer interface {
 	// to whatever fields this server happens to pass through today. fn runs
 	// synchronously on the subscribing client's connection goroutine, so
 	// it must not block or call back into the server while holding a lock.
-	OnSubscribe(fn func(headers map[string]string))
+	OnSubscribe(fn func(p Principal, headers map[string]string))
 
 	// OnUnsubscribe registers fn to be called after every successful
 	// UNSUBSCRIBE, i.e. one the given id actually matched a live subscription
@@ -138,7 +147,7 @@ type StompServer interface {
 	// one's. fn runs synchronously on the unsubscribing client's connection
 	// goroutine, so (like OnSubscribe/OnAck) it must not block or call back
 	// into the server while holding a lock.
-	OnUnsubscribe(fn func(headers map[string]string))
+	OnUnsubscribe(fn func(p Principal, headers map[string]string))
 
 	// OnAck registers fn to be called once for every pending message this
 	// server resolves via a client's ACK. A single cumulative ack:client ACK
@@ -149,7 +158,7 @@ type StompServer interface {
 	// runs synchronously on the acking client's connection goroutine, so
 	// (like OnSubscribe) it must not block or call back into the server
 	// while holding a lock.
-	OnAck(fn func(headers map[string]string))
+	OnAck(fn func(p Principal, headers map[string]string))
 
 	// OnDisconnect registers fn to be called once for every destination the
 	// ending connection ever held a live subscription to -- including one it
@@ -161,7 +170,7 @@ type StompServer interface {
 	// subscribed to anything produces no calls. fn runs synchronously on
 	// that connection's own goroutine, so (like OnSubscribe/OnAck) it must
 	// not block or call back into the server while holding a lock.
-	OnDisconnect(fn func(headers map[string]string))
+	OnDisconnect(fn func(p Principal, headers map[string]string))
 
 	// SendError sends an ERROR frame carrying message to every session
 	// currently subscribed to destination, without closing the connection.
@@ -181,35 +190,35 @@ type StompServer interface {
 var _ StompServer = (*Server)(nil)
 
 // ValidateSubscribe implements StompServer.
-func (s *Server) ValidateSubscribe(fn func(headers map[string]string) error) {
+func (s *Server) ValidateSubscribe(fn func(p Principal, headers map[string]string) error) {
 	s.mu.Lock()
 	s.validators = append(s.validators, fn)
 	s.mu.Unlock()
 }
 
 // OnSubscribe implements StompServer.
-func (s *Server) OnSubscribe(fn func(headers map[string]string)) {
+func (s *Server) OnSubscribe(fn func(p Principal, headers map[string]string)) {
 	s.mu.Lock()
 	s.onSubscribe = append(s.onSubscribe, fn)
 	s.mu.Unlock()
 }
 
 // OnUnsubscribe implements StompServer.
-func (s *Server) OnUnsubscribe(fn func(headers map[string]string)) {
+func (s *Server) OnUnsubscribe(fn func(p Principal, headers map[string]string)) {
 	s.mu.Lock()
 	s.onUnsubscribe = append(s.onUnsubscribe, fn)
 	s.mu.Unlock()
 }
 
 // OnAck implements StompServer.
-func (s *Server) OnAck(fn func(headers map[string]string)) {
+func (s *Server) OnAck(fn func(p Principal, headers map[string]string)) {
 	s.mu.Lock()
 	s.onAck = append(s.onAck, fn)
 	s.mu.Unlock()
 }
 
 // OnDisconnect implements StompServer.
-func (s *Server) OnDisconnect(fn func(headers map[string]string)) {
+func (s *Server) OnDisconnect(fn func(p Principal, headers map[string]string)) {
 	s.mu.Lock()
 	s.onDisconnect = append(s.onDisconnect, fn)
 	s.mu.Unlock()
@@ -303,13 +312,13 @@ func (s *Server) handleConn(conn net.Conn) {
 		for d := range sess.everSubscribed {
 			destinations = append(destinations, d)
 		}
-		callbacks := append([]func(map[string]string){}, s.onDisconnect...)
+		callbacks := append([]func(Principal, map[string]string){}, s.onDisconnect...)
 		s.mu.Unlock()
 
 		for _, d := range destinations {
 			headers := map[string]string{"destination": d}
 			for _, cb := range callbacks {
-				cb(headers)
+				cb(sess.principal, headers)
 			}
 		}
 
@@ -445,10 +454,10 @@ func (s *Server) handleSubscribe(sess *session, frame *Frame) error {
 	}
 
 	s.mu.Lock()
-	validators := append([]func(map[string]string) error{}, s.validators...)
+	validators := append([]func(Principal, map[string]string) error{}, s.validators...)
 	s.mu.Unlock()
 	for _, validate := range validators {
-		if err := validate(frame.Headers); err != nil {
+		if err := validate(sess.principal, frame.Headers); err != nil {
 			return &fatalError{err}
 		}
 	}
@@ -460,11 +469,11 @@ func (s *Server) handleSubscribe(sess *session, frame *Frame) error {
 		s.subscriptions[destination] = map[net.Conn]bool{}
 	}
 	s.subscriptions[destination][sess.conn] = true
-	callbacks := append([]func(map[string]string){}, s.onSubscribe...)
+	callbacks := append([]func(Principal, map[string]string){}, s.onSubscribe...)
 	s.mu.Unlock()
 
 	for _, cb := range callbacks {
-		cb(frame.Headers)
+		cb(sess.principal, frame.Headers)
 	}
 
 	if receipt := frame.Headers["receipt"]; receipt != "" {
@@ -514,12 +523,12 @@ func (s *Server) handleUnsubscribe(sess *session, frame *Frame) error {
 			}
 		}
 	}
-	callbacks := append([]func(map[string]string){}, s.onUnsubscribe...)
+	callbacks := append([]func(Principal, map[string]string){}, s.onUnsubscribe...)
 	s.mu.Unlock()
 
 	headers := map[string]string{"destination": destination, "id": subID}
 	for _, cb := range callbacks {
-		cb(headers)
+		cb(sess.principal, headers)
 	}
 
 	if receipt := frame.Headers["receipt"]; receipt != "" {
@@ -649,7 +658,7 @@ func (s *Server) handleAck(sess *session, frame *Frame) error {
 		return protocolErrorf("unknown ack id: %s", ackID)
 	}
 	resolved := resolve(sess, sess.subscriptions[subID], ackID)
-	callbacks := append([]func(map[string]string){}, s.onAck...)
+	callbacks := append([]func(Principal, map[string]string){}, s.onAck...)
 	s.mu.Unlock()
 
 	for _, r := range resolved {
@@ -660,7 +669,7 @@ func (s *Server) handleAck(sess *session, frame *Frame) error {
 			"ack":          r.ackID,
 		}
 		for _, cb := range callbacks {
-			cb(headers)
+			cb(sess.principal, headers)
 		}
 	}
 

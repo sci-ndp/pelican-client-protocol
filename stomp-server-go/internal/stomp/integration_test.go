@@ -212,7 +212,7 @@ func TestIntegration_OnAckFiresWithExpectedHeaders(t *testing.T) {
 	conn := dialStompClient(t, wsURL, nil)
 
 	acked := make(chan map[string]string, 1)
-	srv.OnAck(func(headers map[string]string) { acked <- headers })
+	srv.OnAck(func(_ Principal, headers map[string]string) { acked <- headers })
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckClientIndividual)
 	if err != nil {
@@ -253,7 +253,7 @@ func TestIntegration_OnAckFiresOncePerMessageOnCumulativeAck(t *testing.T) {
 	var mu sync.Mutex
 	var acked []string
 	done := make(chan struct{})
-	srv.OnAck(func(headers map[string]string) {
+	srv.OnAck(func(_ Principal, headers map[string]string) {
 		mu.Lock()
 		acked = append(acked, headers["message-id"])
 		if len(acked) == 2 {
@@ -329,7 +329,7 @@ func TestIntegration_OnDisconnectFiresOnClientInitiatedDisconnect(t *testing.T) 
 	conn := dialStompClient(t, wsURL, nil)
 
 	disconnected := make(chan map[string]string, 1)
-	srv.OnDisconnect(func(headers map[string]string) { disconnected <- headers })
+	srv.OnDisconnect(func(_ Principal, headers map[string]string) { disconnected <- headers })
 
 	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
 		t.Fatalf("Subscribe: %v", err)
@@ -363,7 +363,7 @@ func TestIntegration_OnDisconnectFiresOnAbruptClose(t *testing.T) {
 	}
 
 	disconnected := make(chan map[string]string, 1)
-	srv.OnDisconnect(func(headers map[string]string) { disconnected <- headers })
+	srv.OnDisconnect(func(_ Principal, headers map[string]string) { disconnected <- headers })
 
 	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
 		t.Fatalf("Subscribe: %v", err)
@@ -389,7 +389,7 @@ func TestIntegration_OnDisconnectDoesNotFireForConnectionWithNoSubscriptions(t *
 	conn := dialStompClient(t, wsURL, nil)
 
 	called := make(chan map[string]string, 1)
-	srv.OnDisconnect(func(headers map[string]string) { called <- headers })
+	srv.OnDisconnect(func(_ Principal, headers map[string]string) { called <- headers })
 
 	if err := conn.Disconnect(); err != nil {
 		t.Fatalf("Disconnect: %v", err)
@@ -409,7 +409,7 @@ func TestIntegration_OnDisconnectFiresOncePerDestinationDespiteDuplicateSubscrip
 
 	var mu sync.Mutex
 	var calls []string
-	srv.OnDisconnect(func(headers map[string]string) {
+	srv.OnDisconnect(func(_ Principal, headers map[string]string) {
 		mu.Lock()
 		calls = append(calls, headers["destination"])
 		mu.Unlock()
@@ -441,7 +441,7 @@ func TestIntegration_OnUnsubscribeFiresWithExpectedHeaders(t *testing.T) {
 	conn := dialStompClient(t, wsURL, nil)
 
 	unsubscribed := make(chan map[string]string, 1)
-	srv.OnUnsubscribe(func(headers map[string]string) { unsubscribed <- headers })
+	srv.OnUnsubscribe(func(_ Principal, headers map[string]string) { unsubscribed <- headers })
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
 	if err != nil {
@@ -524,7 +524,7 @@ func TestIntegration_UnsubscribeUnknownIDIsProtocolError(t *testing.T) {
 	conn := newWSConn(ws)
 
 	unsubscribed := make(chan map[string]string, 1)
-	srv.OnUnsubscribe(func(headers map[string]string) { unsubscribed <- headers })
+	srv.OnUnsubscribe(func(_ Principal, headers map[string]string) { unsubscribed <- headers })
 
 	if _, err := conn.Write(NewFrame("CONNECT", map[string]string{"accept-version": "1.2", "host": "test"}, "").Encode()); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
@@ -643,7 +643,7 @@ func TestIntegration_OnDisconnectFiresForDestinationEvenAfterExplicitUnsubscribe
 	conn := dialStompClient(t, wsURL, nil)
 
 	disconnected := make(chan map[string]string, 1)
-	srv.OnDisconnect(func(headers map[string]string) { disconnected <- headers })
+	srv.OnDisconnect(func(_ Principal, headers map[string]string) { disconnected <- headers })
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
 	if err != nil {
@@ -751,11 +751,11 @@ func TestIntegration_ConnectedReflectsSubscriptionState(t *testing.T) {
 
 func TestIntegration_ValidateSubscribeRejectionSendsErrorAndClosesConnection(t *testing.T) {
 	wsURL, srv := startTestServer(t, NoAuth{})
-	srv.ValidateSubscribe(func(headers map[string]string) error {
+	srv.ValidateSubscribe(func(_ Principal, headers map[string]string) error {
 		return errors.New("not yours")
 	})
 	var subscribed atomic.Bool
-	srv.OnSubscribe(func(map[string]string) { subscribed.Store(true) })
+	srv.OnSubscribe(func(_ Principal, _ map[string]string) { subscribed.Store(true) })
 	conn := dialStompClient(t, wsURL, nil)
 
 	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
@@ -783,5 +783,62 @@ func TestIntegration_ValidateSubscribeRejectionSendsErrorAndClosesConnection(t *
 	}
 	if subscribed.Load() || srv.Connected("/topic/test") {
 		t.Error("rejected SUBSCRIBE still took effect")
+	}
+}
+
+// fixedAuth admits every request as a fixed Principal.
+type fixedAuth struct{ p Principal }
+
+func (a fixedAuth) Authenticate(http.ResponseWriter, *http.Request) (Principal, bool) {
+	return a.p, true
+}
+
+func TestIntegration_AuthenticatedPrincipalReachesCallbacks(t *testing.T) {
+	wsURL, srv := startTestServer(t, fixedAuth{Principal{Name: "alice"}})
+	validated := make(chan Principal, 1)
+	subscribed := make(chan Principal, 1)
+	srv.ValidateSubscribe(func(p Principal, _ map[string]string) error {
+		validated <- p
+		return nil
+	})
+	srv.OnSubscribe(func(p Principal, _ map[string]string) { subscribed <- p })
+	conn := dialStompClient(t, wsURL, nil)
+
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	for name, ch := range map[string]chan Principal{"ValidateSubscribe": validated, "OnSubscribe": subscribed} {
+		select {
+		case p := <-ch:
+			if p.Name != "alice" {
+				t.Errorf("%s principal = %+v, want alice", name, p)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", name)
+		}
+	}
+}
+
+func TestIntegration_ValidateSubscribeCanAuthorizePerPrincipal(t *testing.T) {
+	wsURL, srv := startTestServer(t, fixedAuth{Principal{Name: "alice"}})
+	srv.ValidateSubscribe(func(p Principal, headers map[string]string) error {
+		if !strings.HasPrefix(headers["destination"], "/user/"+p.Name+"/") {
+			return errors.New("forbidden")
+		}
+		return nil
+	})
+	conn := dialStompClient(t, wsURL, nil)
+
+	sub, err := conn.Subscribe("/user/bob/inbox", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	select {
+	case msg := <-sub.C:
+		if msg == nil || msg.Err == nil || msg.Err.Error() != "forbidden" {
+			t.Fatalf("got %+v, want an ERROR frame with message %q", msg, "forbidden")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the ERROR frame")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
 func discardLogger() *slog.Logger {
@@ -38,11 +39,11 @@ type sentError struct {
 // what Connected reports, all without any real network I/O.
 type fakeStompServer struct {
 	mu               sync.Mutex
-	validators       []func(map[string]string) error
-	onSubscribeFns   []func(map[string]string)
-	onUnsubscribeFns []func(map[string]string)
-	onAckFns         []func(map[string]string)
-	onDisconnectFns  []func(map[string]string)
+	validators       []func(stomp.Principal, map[string]string) error
+	onSubscribeFns   []func(stomp.Principal, map[string]string)
+	onUnsubscribeFns []func(stomp.Principal, map[string]string)
+	onAckFns         []func(stomp.Principal, map[string]string)
+	onDisconnectFns  []func(stomp.Principal, map[string]string)
 	connected        map[string]bool
 	publishes        []publishCall
 	sentErrors       []sentError
@@ -60,31 +61,31 @@ func (f *fakeStompServer) Publish(destination string, messageID string, body any
 	return nil
 }
 
-func (f *fakeStompServer) ValidateSubscribe(fn func(headers map[string]string) error) {
+func (f *fakeStompServer) ValidateSubscribe(fn func(p stomp.Principal, headers map[string]string) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.validators = append(f.validators, fn)
 }
 
-func (f *fakeStompServer) OnSubscribe(fn func(headers map[string]string)) {
+func (f *fakeStompServer) OnSubscribe(fn func(p stomp.Principal, headers map[string]string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onSubscribeFns = append(f.onSubscribeFns, fn)
 }
 
-func (f *fakeStompServer) OnUnsubscribe(fn func(headers map[string]string)) {
+func (f *fakeStompServer) OnUnsubscribe(fn func(p stomp.Principal, headers map[string]string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onUnsubscribeFns = append(f.onUnsubscribeFns, fn)
 }
 
-func (f *fakeStompServer) OnAck(fn func(headers map[string]string)) {
+func (f *fakeStompServer) OnAck(fn func(p stomp.Principal, headers map[string]string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onAckFns = append(f.onAckFns, fn)
 }
 
-func (f *fakeStompServer) OnDisconnect(fn func(headers map[string]string)) {
+func (f *fakeStompServer) OnDisconnect(fn func(p stomp.Principal, headers map[string]string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onDisconnectFns = append(f.onDisconnectFns, fn)
@@ -228,8 +229,8 @@ func TestOnEvent_SkipsClientsShouldNotifyRejects(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	srv.setConnected("bob/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
-	app.onSubscribe(subscribeHeaders("bob"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("bob"))
 
 	app.mu.Lock()
 	bobQueue := app.queues["bob"]
@@ -258,7 +259,7 @@ func TestOnEvent_SkipsClientsShouldNotifyRejects(t *testing.T) {
 func TestOnEvent_ShouldNotifyRejectingEveryoneIsNotCountedAsDropped(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 
 	source := app.source.(*fakeEventSource)
 	source.shouldNotify = func(event string, q clientqueue.Queue) bool { return false }
@@ -277,7 +278,7 @@ func TestOnSubscribe_CreatesQueueAndDeliversOnceConnected(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1")
 
 	publishes := srv.snapshotPublishes()
@@ -304,12 +305,12 @@ func TestOnSubscribe_IncrementsConnectedClientsGauge(t *testing.T) {
 		t.Fatalf("connectedClients before any subscribe = %v, want 0", got)
 	}
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
 		t.Errorf("connectedClients after one subscribe = %v, want 1", got)
 	}
 
-	app.onSubscribe(subscribeHeaders("bob"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("bob"))
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 2 {
 		t.Errorf("connectedClients after a second client subscribes = %v, want 2", got)
 	}
@@ -318,12 +319,12 @@ func TestOnSubscribe_IncrementsConnectedClientsGauge(t *testing.T) {
 func TestOnDisconnect_DecrementsConnectedClientsGauge(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
 		t.Fatalf("connectedClients after subscribe = %v, want 1", got)
 	}
 
-	app.onDisconnect(map[string]string{"destination": "alice/testsource"})
+	app.onDisconnect(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
 		t.Errorf("connectedClients after onDisconnect = %v, want 0", got)
@@ -333,9 +334,9 @@ func TestOnDisconnect_DecrementsConnectedClientsGauge(t *testing.T) {
 func TestOnDisconnect_IgnoresUnknownDestination(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 
-	app.onDisconnect(map[string]string{"destination": "someone/else"})
+	app.onDisconnect(stomp.Principal{}, map[string]string{"destination": "someone/else"})
 
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
 		t.Errorf("connectedClients after an unrelated onDisconnect = %v, want still 1 (unaffected)", got)
@@ -346,15 +347,15 @@ func TestOnDisconnect_ReconnectAfterDisconnectIncrementsAgain(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
-	app.onDisconnect(map[string]string{"destination": "alice/testsource"})
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
+	app.onDisconnect(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
 		t.Fatalf("connectedClients after disconnect = %v, want 0", got)
 	}
 
 	// A genuine reconnect (new WebSocket, same subscription header) should
 	// bring the gauge back up, not leave it stuck at 0.
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
 		t.Errorf("connectedClients after reconnecting = %v, want 1", got)
 	}
@@ -364,7 +365,7 @@ func TestOnUnsubscribe_DeletesQueueAndBookkeeping(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1") // gives the queue something retained to delete
 
 	app.mu.Lock()
@@ -374,7 +375,7 @@ func TestOnUnsubscribe_DeletesQueueAndBookkeeping(t *testing.T) {
 		t.Fatal("queue for alice was never created")
 	}
 
-	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
 	app.mu.Lock()
 	_, hasQueue := app.queues["alice"]
@@ -407,12 +408,12 @@ func TestOnUnsubscribe_DecrementsActiveQueuesGauge(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	if got := testutil.ToFloat64(app.metrics.activeQueues); got != 1 {
 		t.Fatalf("activeQueues after subscribe = %v, want 1", got)
 	}
 
-	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
 	if got := testutil.ToFloat64(app.metrics.activeQueues); got != 0 {
 		t.Errorf("activeQueues after onUnsubscribe = %v, want 0", got)
@@ -423,14 +424,14 @@ func TestOnUnsubscribe_CorrectsQueuedEventsForEventsNeverDelivered(t *testing.T)
 	app, _ := newTestApp(defaultConfig)
 	// Deliberately offline: onEvent enqueues but never delivers, so the
 	// queue still holds the event when it's deleted below.
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1")
 	app.onEvent("Event 2")
 	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 2 {
 		t.Fatalf("queuedEvents before unsubscribe = %v, want 2", got)
 	}
 
-	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
 	// Both events are gone without ever being delivered-and-acked; leaving
 	// queuedEvents at 2 would permanently overcount a backlog that no
@@ -443,9 +444,9 @@ func TestOnUnsubscribe_CorrectsQueuedEventsForEventsNeverDelivered(t *testing.T)
 func TestOnUnsubscribe_IgnoresUnknownDestination(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 
-	app.onUnsubscribe(map[string]string{"destination": "someone/else"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "someone/else"})
 
 	app.mu.Lock()
 	_, hasQueue := app.queues["alice"]
@@ -461,12 +462,12 @@ func TestOnUnsubscribe_IgnoresUnknownDestination(t *testing.T) {
 func TestOnUnsubscribe_DoesNotAffectConnectedClientsGauge(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 
 	// Unsubscribing is not the same as disconnecting: the connection (and
 	// this app's per-connection accounting) may still be live even though
 	// the client no longer wants this particular queue.
-	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
 		t.Errorf("connectedClients after onUnsubscribe = %v, want still 1 (unaffected)", got)
@@ -476,19 +477,19 @@ func TestOnUnsubscribe_DoesNotAffectConnectedClientsGauge(t *testing.T) {
 func TestOnDisconnect_DecrementsGaugeEvenAfterPriorUnsubscribe(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 
 	// A client that unsubscribes from its only destination before the
 	// connection itself ends must still have connected-clients decremented
 	// once that connection finally closes -- internal/stomp's OnDisconnect
 	// is expected to still report this destination even though it's no
 	// longer live, precisely so this lookup keeps working.
-	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 1 {
 		t.Fatalf("connectedClients after onUnsubscribe = %v, want still 1", got)
 	}
 
-	app.onDisconnect(map[string]string{"destination": "alice/testsource"})
+	app.onDisconnect(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
 	if got := testutil.ToFloat64(app.metrics.connectedClients); got != 0 {
 		t.Errorf("connectedClients after onDisconnect (following an earlier onUnsubscribe) = %v, want 0", got)
@@ -499,11 +500,11 @@ func TestOnUnsubscribe_ThenResubscribeStartsWithAFreshEmptyQueue(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1")
-	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.mu.Lock()
 	q := app.queues["alice"]
 	app.mu.Unlock()
@@ -516,7 +517,7 @@ func TestOnAck_AdvancesQueueAndDeliversNext(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1")
 	app.onEvent("Event 2") // queued behind the in-flight delivery of Event 1
 
@@ -525,7 +526,7 @@ func TestOnAck_AdvancesQueueAndDeliversNext(t *testing.T) {
 		t.Fatalf("Publish calls after two events = %d, want 1 (second should be queued)", len(first))
 	}
 
-	app.onAck(map[string]string{"destination": "alice/testsource", "message-id": first[0].messageID})
+	app.onAck(stomp.Principal{}, map[string]string{"destination": "alice/testsource", "message-id": first[0].messageID})
 
 	second := srv.snapshotPublishes()
 	if len(second) != 2 {
@@ -544,7 +545,7 @@ func TestOnSubscribe_ResumesExistingQueueAcrossReconnect(t *testing.T) {
 	headers := subscribeHeaders("bob")
 
 	srv.setConnected("bob/testsource", true)
-	app.onSubscribe(headers)
+	app.onSubscribe(stomp.Principal{}, headers)
 	app.onEvent("Event A") // delivered but never acked
 
 	app.mu.Lock()
@@ -554,7 +555,7 @@ func TestOnSubscribe_ResumesExistingQueueAcrossReconnect(t *testing.T) {
 	// Client goes offline, then reconnects with the same subscription header.
 	srv.setConnected("bob/testsource", false)
 	srv.setConnected("bob/testsource", true)
-	app.onSubscribe(headers)
+	app.onSubscribe(stomp.Principal{}, headers)
 
 	app.mu.Lock()
 	resumedQueue := app.queues["bob"]
@@ -584,7 +585,7 @@ func TestOnSubscribe_DeliversToWhateverDestinationClientSubscribedTo(t *testing.
 	const destination = "alice/totally/unrelated/nested/path"
 	srv.setConnected(destination, true)
 
-	app.onSubscribe(map[string]string{
+	app.onSubscribe(stomp.Principal{}, map[string]string{
 		"subscription": "alice",
 		"destination":  destination,
 		"ack":          "client-individual",
@@ -599,7 +600,7 @@ func TestOnSubscribe_DeliversToWhateverDestinationClientSubscribedTo(t *testing.
 		t.Errorf("destination = %q, want %q (whatever the client subscribed to, not a derived convention)", publishes[0].destination, destination)
 	}
 
-	app.onAck(map[string]string{"destination": destination, "message-id": publishes[0].messageID})
+	app.onAck(stomp.Principal{}, map[string]string{"destination": destination, "message-id": publishes[0].messageID})
 	app.onEvent("Event 2")
 
 	second := srv.snapshotPublishes()
@@ -614,7 +615,7 @@ func TestOnSubscribe_UpdatesDestinationWhenClientResubscribesElsewhere(t *testin
 	const newDestination = "alice/new-destination"
 	srv.setConnected(oldDestination, true)
 
-	app.onSubscribe(map[string]string{
+	app.onSubscribe(stomp.Principal{}, map[string]string{
 		"subscription": "alice",
 		"destination":  oldDestination,
 		"ack":          "client-individual",
@@ -622,7 +623,7 @@ func TestOnSubscribe_UpdatesDestinationWhenClientResubscribesElsewhere(t *testin
 
 	// Reconnects with the same subscription header but a different destination.
 	srv.setConnected(newDestination, true)
-	app.onSubscribe(map[string]string{
+	app.onSubscribe(stomp.Principal{}, map[string]string{
 		"subscription": "alice",
 		"destination":  newDestination,
 		"ack":          "client-individual",
@@ -697,7 +698,7 @@ func TestOnSubscribe_PassesSubscriptionParamsToQueueFactory(t *testing.T) {
 		return clientqueue.NewMemoryQueue(clientID, params)
 	}
 
-	app.onSubscribe(map[string]string{
+	app.onSubscribe(stomp.Principal{}, map[string]string{
 		"subscription": "alice",
 		"destination":  "alice/topic=weather&qos=1",
 		"ack":          "client-individual",
@@ -726,8 +727,8 @@ func TestOnSubscribe_ResubscribeWithSameParamsDoesNotRecreateQueue(t *testing.T)
 		return clientqueue.NewMemoryQueue(clientID, params)
 	}
 
-	app.onSubscribe(subscribeHeaders("alice"))
-	app.onSubscribe(subscribeHeaders("alice")) // reconnect with the identical destination
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice")) // reconnect with the identical destination
 
 	if calls != 1 {
 		t.Errorf("queueFactory called %d times, want 1 (params never changed)", calls)
@@ -739,8 +740,8 @@ func TestOnSubscribe_CallsQueueAddedOnceForNewQueue(t *testing.T) {
 	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
 
-	app.onSubscribe(subscribeHeaders("alice"))
-	app.onSubscribe(subscribeHeaders("alice")) // reconnect with the identical destination
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice")) // reconnect with the identical destination
 
 	added := source.snapshotAdded()
 	if len(added) != 1 {
@@ -767,7 +768,7 @@ func TestOnSubscribe_ResubscribeWithDifferentParamsDiscardsOldQueue(t *testing.T
 	source := app.source.(*fakeEventSource)
 
 	srv.setConnected("alice/paramsA", true)
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsA", "ack": "client-individual"})
+	app.onSubscribe(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "alice/paramsA", "ack": "client-individual"})
 	app.onEvent("Event under paramsA")
 
 	app.mu.Lock()
@@ -775,11 +776,11 @@ func TestOnSubscribe_ResubscribeWithDifferentParamsDiscardsOldQueue(t *testing.T
 	app.mu.Unlock()
 
 	// Drops off without ever sending UNSUBSCRIBE for paramsA...
-	app.onDisconnect(map[string]string{"destination": "alice/paramsA"})
+	app.onDisconnect(stomp.Principal{}, map[string]string{"destination": "alice/paramsA"})
 
 	// ...then reconnects with different subscription parameters.
 	srv.setConnected("alice/paramsB", true)
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsB", "ack": "client-individual"})
+	app.onSubscribe(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "alice/paramsB", "ack": "client-individual"})
 
 	app.mu.Lock()
 	newQueue := app.queues["alice"]
@@ -827,13 +828,13 @@ func TestOnSubscribe_ResubscribeWithDifferentParamsDeletesOldDurableRows(t *test
 	app.newQueue = clientqueue.SQLiteFactory(db, discardLogger())
 
 	srv.setConnected("alice/paramsA", true)
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsA", "ack": "client-individual"})
+	app.onSubscribe(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "alice/paramsA", "ack": "client-individual"})
 	app.onEvent("Event under paramsA") // delivered but never acked, so it stays in queue_events
 
-	app.onDisconnect(map[string]string{"destination": "alice/paramsA"})
+	app.onDisconnect(stomp.Principal{}, map[string]string{"destination": "alice/paramsA"})
 
 	srv.setConnected("alice/paramsB", true)
-	app.onSubscribe(map[string]string{"subscription": "alice", "destination": "alice/paramsB", "ack": "client-individual"})
+	app.onSubscribe(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "alice/paramsB", "ack": "client-individual"})
 
 	app.mu.Lock()
 	q := app.queues["alice"]
@@ -885,7 +886,7 @@ func TestRehydrateQueues_SkipsClientIDsAlreadyPresent(t *testing.T) {
 	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
 
-	app.onSubscribe(subscribeHeaders("alice")) // a real, already-connected subscribe first
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice")) // a real, already-connected subscribe first
 	app.mu.Lock()
 	originalQueue := app.queues["alice"]
 	app.mu.Unlock()
@@ -930,7 +931,7 @@ func TestRehydrateQueues_BacklogIsDeliveredOnceTheRealClientSubscribes(t *testin
 	}
 
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice")) // the real client finally reconnects
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice")) // the real client finally reconnects
 
 	publishes := srv.snapshotPublishes()
 	if len(publishes) != 1 {
@@ -946,12 +947,12 @@ func TestOnUnsubscribe_CallsQueueRemoved(t *testing.T) {
 	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.mu.Lock()
 	aliceQueue := app.queues["alice"]
 	app.mu.Unlock()
 
-	app.onUnsubscribe(map[string]string{"destination": "alice/testsource"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "alice/testsource"})
 
 	removed := source.snapshotRemoved()
 	if len(removed) != 1 || removed[0] != aliceQueue {
@@ -963,9 +964,9 @@ func TestOnUnsubscribe_UnknownDestinationDoesNotCallQueueRemoved(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 	source := app.source.(*fakeEventSource)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 
-	app.onUnsubscribe(map[string]string{"destination": "someone/else"})
+	app.onUnsubscribe(stomp.Principal{}, map[string]string{"destination": "someone/else"})
 
 	if got := source.snapshotRemoved(); len(got) != 0 {
 		t.Errorf("QueueRemoved called for an unrelated destination: %v", got)
@@ -976,7 +977,7 @@ func TestOnSubscribe_RejectsDestinationNotOwnedByClient(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("bob/something", true)
 
-	app.onSubscribe(map[string]string{
+	app.onSubscribe(stomp.Principal{}, map[string]string{
 		"subscription": "alice",
 		"destination":  "bob/something",
 		"ack":          "client-individual",
@@ -998,7 +999,7 @@ func TestOnSubscribe_RejectsDestinationWithMatchingPrefixButDifferentSegment(t *
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("aliceX/foo", true)
 
-	app.onSubscribe(map[string]string{
+	app.onSubscribe(stomp.Principal{}, map[string]string{
 		"subscription": "alice",
 		"destination":  "aliceX/foo",
 		"ack":          "client-individual",
@@ -1016,7 +1017,7 @@ func TestOnEvent_DisconnectsConnectedClientOnOverflow(t *testing.T) {
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	for _, e := range []string{"E1", "E2", "E3", "E4"} {
 		app.onEvent(e) // never acked, so the queue keeps growing behind E1
 	}
@@ -1057,7 +1058,7 @@ func TestOnEvent_TrimsWithoutDisconnectingWhenOffline(t *testing.T) {
 	// The client subscribed once (so the queue exists) but is now offline;
 	// events keep arriving via the broadcast fan-out regardless.
 	srv.setConnected("alice/testsource", true)
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	srv.setConnected("alice/testsource", false)
 
 	for _, e := range []string{"E1", "E2", "E3", "E4"} {
@@ -1101,7 +1102,7 @@ func TestOnRetryTimeout_BacksOffThenGivesUpAndDisconnects(t *testing.T) {
 	app, srv := newTestApp(cfg)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1") // delivered, then never acked
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -1142,7 +1143,7 @@ func TestOnAck_IgnoresMismatchedOrUnknownAck(t *testing.T) {
 	app, srv := newTestApp(defaultConfig)
 	srv.setConnected("alice/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("alice"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("alice"))
 	app.onEvent("Event 1")
 
 	app.mu.Lock()
@@ -1150,9 +1151,9 @@ func TestOnAck_IgnoresMismatchedOrUnknownAck(t *testing.T) {
 	app.mu.Unlock()
 
 	// Ack for a message id that doesn't match the current in-flight delivery.
-	app.onAck(map[string]string{"destination": "alice/testsource", "message-id": "not-the-real-id"})
+	app.onAck(stomp.Principal{}, map[string]string{"destination": "alice/testsource", "message-id": "not-the-real-id"})
 	// Ack for a destination this app doesn't own.
-	app.onAck(map[string]string{"destination": "somewhere/else", "message-id": "whatever"})
+	app.onAck(stomp.Principal{}, map[string]string{"destination": "somewhere/else", "message-id": "whatever"})
 
 	app.mu.Lock()
 	q := app.queues["alice"]
@@ -1181,7 +1182,7 @@ func TestApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	srv1 := newFakeStompServer()
 	srv1.setConnected("carol/testsource", true)
 	app1 := NewWithConfig(srv1, discardLogger(), newFakeEventSource(), defaultConfig, clientqueue.SQLiteFactory(db1, discardLogger()))
-	app1.onSubscribe(subscribeHeaders("carol"))
+	app1.onSubscribe(stomp.Principal{}, subscribeHeaders("carol"))
 	app1.onEvent("Event 1") // delivered but never acked
 	if got := srv1.snapshotPublishes(); len(got) != 1 {
 		t.Fatalf("Publish calls before restart = %d, want 1: %+v", len(got), got)
@@ -1200,7 +1201,7 @@ func TestApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 	srv2 := newFakeStompServer()
 	srv2.setConnected("carol/testsource", true)
 	app2 := NewWithConfig(srv2, discardLogger(), newFakeEventSource(), defaultConfig, clientqueue.SQLiteFactory(db2, discardLogger()))
-	app2.onSubscribe(subscribeHeaders("carol"))
+	app2.onSubscribe(stomp.Principal{}, subscribeHeaders("carol"))
 
 	publishes := srv2.snapshotPublishes()
 	if len(publishes) != 1 {
@@ -1217,7 +1218,7 @@ func TestApp_ResumesSQLiteBackedQueueAfterRestart(t *testing.T) {
 		t.Fatalf("queuedEvents after resuming a 1-event backlog = %v, want 1", got)
 	}
 
-	app2.onAck(map[string]string{"destination": "carol/testsource", "message-id": publishes[0].messageID})
+	app2.onAck(stomp.Principal{}, map[string]string{"destination": "carol/testsource", "message-id": publishes[0].messageID})
 	if got := testutil.ToFloat64(app2.metrics.queuedEvents); got != 0 {
 		t.Errorf("queuedEvents after acking the resumed event = %v, want 0 (must not go negative)", got)
 	}
@@ -1235,7 +1236,7 @@ func TestOnSubscribe_ReconnectWithoutRestartDoesNotDoubleCountGauge(t *testing.T
 	app.newQueue = clientqueue.SQLiteFactory(db, discardLogger())
 	srv.setConnected("dave/testsource", true)
 
-	app.onSubscribe(subscribeHeaders("dave"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("dave"))
 	app.onEvent("Event 1") // delivered but never acked
 
 	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 1 {
@@ -1245,7 +1246,7 @@ func TestOnSubscribe_ReconnectWithoutRestartDoesNotDoubleCountGauge(t *testing.T
 	// Reconnects without a process restart: existed is true this time, so
 	// the gauge must not be re-seeded from the durable backlog -- that
 	// backlog is the SAME event already counted once, not a new one.
-	app.onSubscribe(subscribeHeaders("dave"))
+	app.onSubscribe(stomp.Principal{}, subscribeHeaders("dave"))
 
 	if got := testutil.ToFloat64(app.metrics.queuedEvents); got != 1 {
 		t.Errorf("queuedEvents after in-process reconnect = %v, want still 1 (must not double-count)", got)
@@ -1258,17 +1259,46 @@ func TestValidateSubscribe_RejectsDestinationNotOwnedByClient(t *testing.T) {
 	validate := srv.validators[0]
 	srv.mu.Unlock()
 
-	if err := validate(map[string]string{"subscription": "alice", "destination": "bob/x"}); err == nil {
+	if err := validate(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "bob/x"}); err == nil {
 		t.Error("expected a rejection for a destination owned by another client")
 	}
-	if err := validate(map[string]string{"subscription": "alice", "destination": "aliceX/x"}); err == nil {
+	if err := validate(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "aliceX/x"}); err == nil {
 		t.Error("expected a rejection for a destination whose first segment is not exactly the client's id")
 	}
-	if err := validate(map[string]string{"subscription": "", "destination": "alice/x"}); err == nil {
+	if err := validate(stomp.Principal{}, map[string]string{"subscription": "", "destination": "alice/x"}); err == nil {
 		t.Error("expected a rejection for a missing subscription header")
 	}
-	if err := validate(map[string]string{"subscription": "alice", "destination": "alice/x"}); err != nil {
+	if err := validate(stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "alice/x"}); err != nil {
 		t.Errorf("owned destination rejected: %v", err)
 	}
 	_ = app
+}
+
+type denyAuthorizer struct{ deny map[string]bool }
+
+func (d denyAuthorizer) Authorize(p stomp.Principal, destination string) bool {
+	return !d.deny[p.Name+" "+destination]
+}
+
+func TestValidateSubscribe_ConsultsAuthorizerWithPrincipalAndDestination(t *testing.T) {
+	srv := newFakeStompServer()
+	NewWithConfig(srv, discardLogger(), newFakeEventSource(), defaultConfig, clientqueue.NewMemoryQueue,
+		WithAuthorizer(denyAuthorizer{deny: map[string]bool{"mallory alice/x": true}}))
+	validate := srv.validators[0]
+
+	headers := map[string]string{"subscription": "alice", "destination": "alice/x"}
+	if err := validate(stomp.Principal{Name: "mallory"}, headers); err == nil {
+		t.Error("subscription denied by the Authorizer was accepted")
+	}
+	if err := validate(stomp.Principal{Name: "alice"}, headers); err != nil {
+		t.Errorf("subscription allowed by the Authorizer was rejected: %v", err)
+	}
+}
+
+func TestValidateSubscribe_DefaultAuthorizerAllowsEverything(t *testing.T) {
+	app, srv := newTestApp(defaultConfig)
+	_ = app
+	if err := srv.validators[0](stomp.Principal{}, map[string]string{"subscription": "alice", "destination": "alice/x"}); err != nil {
+		t.Errorf("default authorizer rejected a subscription: %v", err)
+	}
 }

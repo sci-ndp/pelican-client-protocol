@@ -64,11 +64,21 @@ func main() {
 		logger.Info("using in-memory demo ticker event source")
 	}
 
+	var authenticator notificationserver.Authenticator
+	if *htpasswdFile != "" {
+		a, err := notificationserver.NewBasicAuth(*htpasswdFile, logger)
+		if err != nil {
+			logger.Error("failed to load htpasswd file", "error", err)
+			os.Exit(1)
+		}
+		authenticator = a
+	}
+
 	handler, err := notificationserver.New(notificationserver.NotificationServerArgs{
-		EventSource:  source,
-		Logger:       logger,
-		HtpasswdFile: *htpasswdFile,
-		QueueDB:      *queueDB,
+		EventSource:   source,
+		Logger:        logger,
+		Authenticator: authenticator,
+		QueueDB:       *queueDB,
 	})
 	if err != nil {
 		logger.Error("failed to start notification server", "error", err)

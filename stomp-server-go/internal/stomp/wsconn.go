@@ -19,9 +19,14 @@ import (
 // but readFrame (protocol.go) relies on each Read returning exactly one
 // WebSocket message by using a buffer sized larger than any real frame.
 type wsConn struct {
-	ws   *websocket.Conn
-	rbuf []byte // leftover bytes from the most recently read WS message
+	ws        *websocket.Conn
+	rbuf      []byte    // leftover bytes from the most recently read WS message
+	principal Principal // set by wsListener from the authenticated upgrade request
 }
+
+// Principal reports who the HTTP upgrade behind this connection was
+// authenticated as. Server.Serve looks for this method on accepted conns.
+func (c *wsConn) Principal() Principal { return c.principal }
 
 func newWSConn(ws *websocket.Conn) *wsConn {
 	return &wsConn{ws: ws}

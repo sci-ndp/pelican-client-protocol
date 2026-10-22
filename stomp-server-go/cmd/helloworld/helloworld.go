@@ -40,7 +40,7 @@ func newHelloWorldApp(srv stomp.StompServer, log *slog.Logger) *helloWorldApp {
 // onSubscribe starts a broadcast loop the first time a SUBSCRIBE's
 // destination is seen; later subscriptions to an already-seen destination
 // are no-ops, since a loop for it is already running.
-func (a *helloWorldApp) onSubscribe(headers map[string]string) {
+func (a *helloWorldApp) onSubscribe(_ stomp.Principal, headers map[string]string) {
 	destination := headers["destination"]
 
 	a.mu.Lock()

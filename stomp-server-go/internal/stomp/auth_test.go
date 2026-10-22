@@ -45,8 +45,12 @@ func TestBasicAuthAcceptsCorrectCredentials(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.SetBasicAuth("alice", "s3cret")
 	w := httptest.NewRecorder()
-	if !a.Authenticate(w, r) {
+	p, ok := a.Authenticate(w, r)
+	if !ok {
 		t.Fatal("expected Authenticate to accept correct credentials")
+	}
+	if p.Name != "alice" {
+		t.Errorf("principal = %+v, want Name alice", p)
 	}
 }
 
@@ -60,7 +64,7 @@ func TestBasicAuthRejectsWrongPassword(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.SetBasicAuth("alice", "wrong")
 	w := httptest.NewRecorder()
-	if a.Authenticate(w, r) {
+	if _, ok := a.Authenticate(w, r); ok {
 		t.Fatal("expected Authenticate to reject wrong password")
 	}
 	if w.Code != http.StatusUnauthorized {
@@ -77,7 +81,7 @@ func TestBasicAuthRejectsMissingCredentials(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
-	if a.Authenticate(w, r) {
+	if _, ok := a.Authenticate(w, r); ok {
 		t.Fatal("expected Authenticate to reject a request with no credentials")
 	}
 }
@@ -96,7 +100,7 @@ func TestNewBasicAuthRejectsNonBcryptHash(t *testing.T) {
 func TestNoAuthAcceptsEverything(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	w := httptest.NewRecorder()
-	if !(NoAuth{}).Authenticate(w, r) {
+	if p, ok := (NoAuth{}).Authenticate(w, r); !ok || !p.Anonymous() {
 		t.Fatal("expected NoAuth to accept every request")
 	}
 }
