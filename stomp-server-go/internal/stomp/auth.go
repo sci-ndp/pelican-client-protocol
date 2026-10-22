@@ -19,6 +19,13 @@ import (
 // to). The zero value is the anonymous principal.
 type Principal struct {
 	Name string
+
+	// Data carries whatever extra identity an Authenticator wants to hand to
+	// an Authorizer or other callback (roles, claims, a user record, ...). It
+	// is opaque to this package; the Authenticator and the code consuming the
+	// Principal agree on its concrete type. Note that a Principal holding
+	// non-comparable Data (e.g. a map) must not be compared with ==.
+	Data any
 }
 
 // Anonymous reports whether p carries no authenticated identity.
