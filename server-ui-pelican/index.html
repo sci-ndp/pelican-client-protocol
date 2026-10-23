@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pelican Object Subscribe</title>
+  <style>
+    :root{color-scheme:dark;--bg:#10151c;--panel:#18212c;--line:#2b3948;--muted:#91a2b5;--green:#54d68a;--blue:#73b8ff;--red:#ff8b8b;--amber:#f5c26b;--violet:#b9a2ff}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:#edf4fb;font:14px system-ui,sans-serif}
+    main{max-width:1000px;margin:auto;padding:32px 20px}
+    h1{margin:0 0 6px}h2{margin:0;font-size:16px}h3{margin:16px 0 0;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+    p{color:var(--muted);line-height:1.5}
+    code{color:#c9e4ff;font:12px ui-monospace,monospace}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-top:18px}
+    .op{border-left:4px solid var(--blue)}.op.ws{border-left-color:var(--violet)}.op.pending{opacity:.45}
+    .opHead{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .badge{font:700 12px ui-monospace,monospace;padding:4px 8px;border-radius:5px;background:var(--blue);color:#06131f}
+    .ws .badge{background:var(--violet)}
+    .path{font:13px ui-monospace,monospace;color:#edf4fb;word-break:break-all}
+    .form{display:grid;grid-template-columns:1fr 160px;gap:10px}
+    .form label.wide{grid-column:1/-1}
+    label{display:grid;gap:5px;color:var(--muted);min-width:0}
+    input{width:100%;min-width:0;background:#0f151c;border:1px solid var(--line);color:inherit;border-radius:6px;padding:9px;font:inherit}
+    button{background:var(--green);border:0;border-radius:6px;padding:10px 14px;font-weight:700;cursor:pointer}
+    button.secondary{background:#344454;color:#fff}
+    button:disabled{opacity:.5;cursor:default}
+    .actions{display:flex;gap:10px;align-items:center;margin-top:14px}
+    .status{margin-left:auto;color:var(--muted)}.connected{color:var(--green)}.error{color:var(--red)}
+    details{margin-top:12px;color:var(--muted)}summary{cursor:pointer;color:var(--blue)}
+    pre{max-height:320px;min-height:36px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:#0d131a;border:1px solid var(--line);border-radius:7px;padding:12px;margin:8px 0 0;font:12px ui-monospace,monospace;color:#c9e4ff}
+    pre#notifications{min-height:200px;max-height:420px;color:#e6ffee}
+    .hl{color:var(--amber);font-weight:700}
+    .dim{color:var(--muted)}
+    .note{font-size:13px;margin:8px 0 0}
+    table{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px}
+    th,td{text-align:left;padding:7px 10px;border:1px solid var(--line);vertical-align:top}
+    th{color:var(--muted);font-weight:600;background:#111820}
+    td code{word-break:break-all}
+    .topic{display:flex;flex-wrap:wrap;font:13px ui-monospace,monospace;margin-top:10px}
+    .topic span{padding:6px 8px;border:1px solid var(--line);border-right:0;background:#0d131a}
+    .topic span:last-child{border-right:1px solid var(--line)}
+    .topic span.sep{color:var(--muted);padding:6px 4px;background:none;border:0}
+    .topic small{display:block;color:var(--muted);font:11px system-ui,sans-serif;margin-bottom:2px}
+  </style>
+</head>
+<body><main>
+  <h1>Pelican Object Subscribe</h1>
+  <p>How a client learns of new and changed objects under a federation path: it asks the director for a notify-capable origin, opens an authenticated WebSocket to that origin's notification server, and subscribes to a topic derived from the path.
+  This page is interactive documentation, in the spirit of a Swagger "Try it out": fill in the form and each step below shows the exchange <code>pelican object subscribe</code> performs, with your values.</p>
+  <p class="note">The written requests and responses are the ones the Pelican client exchanges.
+  A browser cannot send or read some of those parts (an <code>Authorization</code> header on a WebSocket, the headers of a redirect), so the page makes equivalent requests.
+  Open <b>What this page actually sent</b> under a step for the difference.</p>
+
+  <section class="card">
+    <h2>Try it out</h2>
+    <form id="form" class="form" autocomplete="off">
+      <label class="wide">Object federation path (the host is the director)
+        <input id="url" required placeholder="pelican://director.example.org:8444/public/data/" spellcheck="false"></label>
+      <label>Access token (leave blank for a public namespace)
+        <input id="token" type="password" autocomplete="off" spellcheck="false"></label>
+      <label>Search depth
+        <input id="depth" type="number" min="1" value="1" required></label>
+    </form>
+    <details><summary>How do I get an access token?</summary>
+      <p>If the namespace requires authorization, subscribing needs a token with a <code>storage.read</code> scope covering the path.
+      On the origin host, with the origin's own config and signing keys, mint one:</p>
+<pre>pelican-server origin token create \
+  --profile wlcg \
+  --lifetime 3600 \
+  --subject my-user \
+  --scope "storage.read:/" \
+  --audience "https://origin.example.org:8443"</pre>
+      <p>The <code>--audience</code> must be one the origin accepts: its own URL (<code>Origin.Url</code>, the default <code>Origin.TokenAudience</code>) or the WLCG wildcard.
+      A literal <code>any</code> is rejected with <code>'aud' claim verification failed</code> in the origin log.
+      Scopes are relative to the federation prefix, and the export must not set <code>PublicReads</code> if you want to require the token.
+      The token's <code>iss</code> must be one of the export's trusted issuers.
+      When the token expires, the origin closes the subscription.</p></details>
+    <details><summary>Running this against a development federation</summary>
+      <p>The page calls the director and origin from your browser, so it must trust their certificates.
+      For a self-signed development federation, open the director's and the origin's HTTPS URLs in a tab once and accept the certificate.
+      The director allows cross-origin requests; the origin's WebSocket accepts any page origin.</p></details>
+    <div class="actions"><button id="go" form="form">Subscribe</button><button id="stop" class="secondary" type="button" disabled>Disconnect</button><span id="status" class="status">Idle</span></div>
+  </section>
+
+  <section id="s1" class="card op pending">
+    <div class="opHead"><span class="badge">GET</span><span class="path">&lt;director&gt;/&lt;object path&gt;?notify</span></div>
+    <h2 style="margin-top:8px">1. Ask the director for a notify-capable origin</h2>
+    <p class="note">The <code>notify</code> query asks for origins that advertise the Notify capability.
+    The client sends no token, and does not follow the redirect: the headers are the answer.
+    <code class="hl">Location</code> points at the origin that serves the path, and <code class="hl">X-Pelican-Namespace</code> carries the namespace, whether it requires a token, and the <code>notify-url</code>, the origin's WebSocket endpoint.
+    The client subscribes at the <code>notify-url</code>, not at the redirect.</p>
+    <div id="s1-body"></div></section>
+
+  <section id="s2" class="card op ws pending">
+    <div class="opHead"><span class="badge">GET</span><span class="path">&lt;notify-url&gt;  <span class="dim">Upgrade: websocket</span></span></div>
+    <h2 style="margin-top:8px">2. Open the notification connection</h2>
+    <p class="note">A WebSocket begins as an HTTP request that asks to switch protocols.
+    The origin authenticates that request: a bearer token in the <code>Authorization</code> header, checked against the origin's trusted issuers.
+    A request with no token is anonymous and can subscribe only to publicly readable paths.</p>
+    <div id="s2-body"></div></section>
+
+  <section id="s3" class="card op ws pending">
+    <div class="opHead"><span class="badge">STOMP</span><span class="path">SUBSCRIBE  destination: &lt;topic&gt;</span></div>
+    <h2 style="margin-top:8px">3. Topic and subscription</h2>
+    <p class="note">The federation path and depth become a STOMP destination, <code>&lt;client id&gt;/&lt;depth&gt;/&lt;protocol&gt;/&lt;object path&gt;</code>.
+    Depth counts levels below the path: objects directly in it are one level down.
+    The protocol is the URL's scheme.
+    The client id names the subscription: the SUBSCRIBE's <code>subscription</code> header repeats it, and reconnecting with the same one resumes events that were not acknowledged.</p>
+    <div id="s3-body"></div></section>
+
+  <section id="s4" class="card op ws pending">
+    <div class="opHead"><span class="badge">MESSAGE</span><span class="path">one object path per notification</span></div>
+    <h2 style="margin-top:8px">4. Notifications</h2>
+    <p class="note">The origin lists the watched part of the namespace on an interval and announces objects that are new or modified.
+    Each message body is a JSON string holding the object's federation path.
+    The client acknowledges each one once handled, so an unacknowledged notification is sent again.</p>
+    <pre id="notifications">Waiting for a subscription.</pre>
+    <details><summary>Raw STOMP frames</summary><pre id="frames"></pre></details></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const NOTIFY_QUERY='notify';
+let ws=null,heartbeat=null;
+
+function setStatus(text,kind=''){$('status').textContent=text;$('status').className='status '+kind}
+function reveal(id){$(id).classList.remove('pending')}
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+function pre(...parts){const p=el('pre');p.append(...parts);return p}
+function section(label,node){const w=el('div');w.append(el('h3','',label),node);return w}
+function put(id,...nodes){$(id).replaceChildren(...nodes)}
+function note(summary,text){const d=el('details');d.append(el('summary','',summary),pre(text));return d}
+function headerLines(pairs,highlight=[]){
+  const out=[];
+  for(const [name,value,dim] of pairs){
+    const line=name+': '+value;
+    out.push(highlight.includes(name.toLowerCase())?el('span','hl',line):dim?el('span','dim',line):line,'\n');
+  }
+  return out;
+}
+function shorten(token){return token.length<=20?'<redacted>':token.slice(0,10)+'…'+token.slice(-6)}
+function fail(msg){setStatus(msg,'error')}
+function shellQuote(s){return "'"+s.replaceAll("'","'\\''")+"'"}
+
+// Split pelican://director-host[:port]/path into the director and the object
+// path.  The host of the URL is taken to be the director.
+function parseFederationUrl(raw){
+  let u;try{u=new URL(raw.trim())}catch{throw new Error('Not a URL: '+raw)}
+  const scheme=u.protocol.replace(/:$/,'');
+  if(scheme!=='pelican')throw new Error('Use a pelican:// URL, e.g. pelican://director.example.org:8444/ns/dir/');
+  if(!u.host)throw new Error('The URL has no director host');
+  return{scheme,director:'https://'+u.host,objPath:u.pathname};
+}
+// The topic is "<client id>/<depth>/<protocol>/<object path>", as formatted by
+// server_structs.SubscriptionTopic.
+function cleanPath(p){
+  const out=[];for(const seg of ('/'+p).split('/')){if(seg===''||seg==='.')continue;if(seg==='..')out.pop();else out.push(seg)}
+  return '/'+out.join('/');
+}
+function subscriptionTopic(clientId,depth,protocol,objPath){return clientId+'/'+depth+'/'+protocol+cleanPath(objPath)}
+function randomId(){const b=new Uint8Array(6);crypto.getRandomValues(b);return 'docs-'+[...b].map(x=>x.toString(16).padStart(2,'0')).join('')}
+
+// parseKeyValues reads "k=v, k=v" as X-Pelican-Namespace is written.
+function parseKeyValues(s){
+  const out={};
+  for(const part of (s||'').split(',')){const i=part.indexOf('=');if(i>0)out[part.slice(0,i).trim()]=part.slice(i+1).trim().replace(/^"|"$/g,'')}
+  return out;
+}
+
+function reset(){
+  for(const id of ['s1','s2','s3','s4'])$(id).classList.add('pending');
+  for(const id of ['s1-body','s2-body','s3-body'])put(id);
+  $('notifications').textContent='Waiting for a subscription.';
+  $('frames').textContent='';
+}
+
+// networkHint explains the usual reason a browser request fails outright.
+function networkHint(url,e){
+  return 'Could not reach '+url+' ('+e.message+'). In a browser this is usually an untrusted TLS certificate, a blocked mixed-content request, or no CORS headers; open the URL in a tab to check.';
+}
+
+$('form').addEventListener('submit',async ev=>{
+  ev.preventDefault();
+  closeSocket();reset();
+  $('go').disabled=true;setStatus('Asking the director…');
+  try{
+    const fed=parseFederationUrl($('url').value);
+    const depth=parseInt($('depth').value,10);
+    const token=$('token').value.trim();
+    const objPath=cleanPath(fed.objPath);
+
+    const director=fed.director;
+    const dHost=new URL(director).host;
+
+    // 1. Director
+    const dirUrl=director+objPath+'?'+NOTIFY_QUERY+'=';
+    const actualDirUrl=director+objPath+'?'+NOTIFY_QUERY+'&redirect=false';
+    let res;
+    try{res=await fetch(actualDirUrl)}catch(e){throw new Error(networkHint(actualDirUrl,e))}
+    const readable=[...res.headers].map(([k,v])=>[k.replace(/(^|-)([a-z])/g,(m,a,b)=>a+b.toUpperCase()),v]);
+    const ns=parseKeyValues(res.headers.get('X-Pelican-Namespace'));
+    const notifyUrl=ns['notify-url']||'';
+    const namespace=ns['namespace']||'';
+    const requireToken=ns['require-token']==='true';
+    reveal('s1');
+    const shownHeaders=[...readable.filter(([k])=>k!=='Content-Length'&&k!=='Content-Type'),
+      ['Location','https://<origin>:<port>'+objPath+'  (the origin serving the path)',true]];
+    put('s1-body',
+      section('Request',pre('GET '+objPath+'?'+NOTIFY_QUERY+'= HTTP/1.1\nHost: '+dHost+'\nUser-Agent: pelican-client/<version>')),
+      section('Response',pre('HTTP/1.1 307 Temporary Redirect\n',...headerLines(shownHeaders,['location','x-pelican-namespace']))),
+      section('What the client reads from it',pre('namespace:     '+(namespace||'(none)')+'\nrequire-token: '+requireToken+'\nnotify-url:    '+(notifyUrl||'(none)'))),
+      section('Same request with curl',pre('curl -sk -D - -o /dev/null '+shellQuote(dirUrl))),
+      note('What this page actually sent','GET '+actualDirUrl+'\n\nA browser cannot read the headers of a redirect: fetch() follows it, or returns an opaque response. '+
+        'The director answers the same request with 200 and the same headers when the query has redirect=false, so the page asks that way. '+
+        'The status and Location shown above are what the client sees without it. '+
+        'Only headers the director exposes to cross-origin pages are readable here (actual status: '+res.status+').'));
+    if(!res.ok&&!notifyUrl)throw new Error('The director answered '+res.status+' '+res.statusText+'; no origin exporting this path may advertise Notify');
+    if(!notifyUrl)throw new Error('The director gave no notify-url: no origin exporting this path advertises the Notify capability');
+
+    // 3. Topic (computed before connecting; shown in its own step)
+    const clientId=randomId();
+    const protocol=fed.scheme;
+    const topic=subscriptionTopic(clientId,depth,protocol,objPath);
+    reveal('s3');
+    put('s3-body',topicView(clientId,depth,protocol,objPath,topic));
+
+    if(requireToken&&!token)setStatus('This namespace requires a token; the origin will likely refuse','error');
+
+    // 2. WebSocket upgrade
+    setStatus('Opening the notification connection…');
+    const nu=new URL(notifyUrl);
+    const actualWsUrl=notifyUrl+(token?(nu.search?'&':'?')+'authz='+encodeURIComponent('Bearer '+token):'');
+    const upgradeHeaders=[['Host',nu.host],['Upgrade','websocket'],['Connection','Upgrade'],['Sec-WebSocket-Version','13'],['Sec-WebSocket-Key','<random base64>'],['User-Agent','pelican-client/<version>']];
+    if(token)upgradeHeaders.push(['Authorization','Bearer '+shorten(token)+'  (shortened for display)']);
+    reveal('s2');
+    put('s2-body',
+      section('Request',pre('GET '+nu.pathname+nu.search+' HTTP/1.1\n',...headerLines(upgradeHeaders,['authorization']))),
+      section('Response',pre('HTTP/1.1 101 Switching Protocols\nUpgrade: websocket\nConnection: Upgrade\nSec-WebSocket-Accept: <derived from Sec-WebSocket-Key>')),
+      section('Same request with curl',pre('curl -sk -i -N \\\n  -H "Connection: Upgrade" -H "Upgrade: websocket" \\\n  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" \\\n'+(token?'  -H "Authorization: Bearer $TOKEN" \\\n':'')+'  '+shellQuote(notifyUrl))),
+      note('What this page actually sent','GET '+(token?actualWsUrl.replace(encodeURIComponent('Bearer '+token),encodeURIComponent('Bearer ')+shorten(token)):actualWsUrl)+'  (Upgrade: websocket)\n\n'+
+        'The browser WebSocket API cannot set request headers, so the page passes the token in the authz query parameter, which the origin accepts as well as the Authorization header. '+
+        'The browser adds its own Origin header and Sec-WebSocket-Key, and does not expose the response headers.'));
+
+    reveal('s4');
+    openSocket(actualWsUrl,{clientId,topic,objPath,depth});
+  }catch(e){fail(e.message)}
+  finally{$('go').disabled=false}
+});
+
+function topicView(clientId,depth,protocol,objPath,topic){
+  const w=el('div');
+  const parts=[['client id',clientId],['depth',String(depth)],['protocol',protocol],['object path',objPath]];
+  const row=el('div','topic');
+  parts.forEach(([label,value],i)=>{
+    const s=el('span');s.append(el('small','',label),value);row.append(s);
+    if(i<2)row.append(el('span','sep','/'));
+  });
+  const rows=[
+    ['destination',topic,'The topic: what to subscribe to.'],
+    ['id',clientId,'The STOMP subscription id. The client id names the subscription.'],
+    ['subscription',clientId,'Must equal the client id the topic starts with. The origin keeps the subscription\'s undelivered events under it, and answers a mismatch with an ERROR frame.'],
+    ['ack','client-individual','Every MESSAGE must be acknowledged on its own with an ACK frame; one that is not is sent again.'],
+  ];
+  const table=el('table'),head=el('tr');
+  for(const h of ['SUBSCRIBE header','Value','Requirement'])head.append(el('th','',h));
+  table.append(head);
+  for(const [name,value,why] of rows){
+    const tr=el('tr'),k=el('td'),v=el('td');
+    k.append(el('code','',name));v.append(el('code','',value));
+    tr.append(k,v,el('td','',why));table.append(tr);
+  }
+  w.append(row,section('Topic (the SUBSCRIBE destination)',pre(topic)),section('SUBSCRIBE frame headers',table));
+  return w;
+}
+
+// STOMP framing, as in the stomp-server-go UI.
+const esc=v=>String(v).replaceAll('\\','\\\\').replaceAll('\n','\\n').replaceAll(':','\\c').replaceAll('\r','\\r');
+const frame=(c,h={},b='')=>c+'\n'+Object.entries(h).map(([k,v])=>k+':'+esc(v)).join('\n')+'\n\n'+b+'\0';
+function parse(raw){
+  const [head,...rest]=raw.replace(/\0$/,'').split('\n\n');const lines=head.split('\n');const headers={};
+  for(const line of lines.slice(1)){const i=line.indexOf(':');if(i>0)headers[line.slice(0,i)]=line.slice(i+1).replaceAll('\\n','\n').replaceAll('\\r','\r').replaceAll('\\c',':').replaceAll('\\\\','\\')}
+  return{command:lines[0],headers,body:rest.join('\n\n')};
+}
+function logFrame(dir,raw){const f=$('frames');f.textContent+=dir+'\n'+raw.replace(/\0/g,'<NUL>')+'\n\n';f.scrollTop=f.scrollHeight}
+function sendFrame(c,h,b){const raw=frame(c,h,b);ws.send(raw);logFrame('CLIENT → ORIGIN',raw)}
+
+function openSocket(wsUrl,sub){
+  const out=$('notifications');let first=true;
+  let opened=false;
+  ws=new WebSocket(wsUrl);
+  // The notification server sends STOMP frames as binary messages; the default
+  // would deliver them as Blobs, which cannot be decoded synchronously.
+  ws.binaryType='arraybuffer';
+  ws.onopen=()=>{
+    opened=true;
+    $('stop').disabled=false;setStatus('Connected; subscribing…','connected');
+    const ms=10000;
+    sendFrame('CONNECT',{'accept-version':'1.2',host:'pelican-docs','heart-beat':`${ms},${ms}`});
+    heartbeat=setInterval(()=>{if(ws&&ws.readyState===1)ws.send('\n')},ms);
+  };
+  ws.onmessage=e=>{
+    const text=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
+    if(text==='\n')return;
+    logFrame('ORIGIN → CLIENT',text);
+    const f=parse(text);
+    if(f.command==='CONNECTED'){
+      // The topic starts with the client id; the origin matches the two.
+      sendFrame('SUBSCRIBE',{id:sub.clientId,subscription:sub.clientId,destination:sub.topic,ack:'client-individual'});
+      setStatus('Subscribed to '+sub.topic,'connected');
+      out.textContent='Subscribed. Waiting for objects to appear under '+sub.objPath+' (depth '+sub.depth+')…\n';
+    }else if(f.command==='MESSAGE'){
+      let line;try{line=JSON.parse(f.body)}catch{line=f.body}
+      if(first){out.textContent='';first=false}
+      out.textContent+=line+'\n';out.scrollTop=out.scrollHeight;
+      if(f.headers.ack)sendFrame('ACK',{id:f.headers.ack});
+    }else if(f.command==='ERROR'){
+      fail('Origin error: '+(f.headers.message||f.body));
+    }
+  };
+  // A refused upgrade (401/403) is reported by the browser as a bare error and close.
+  ws.onerror=()=>{if(!opened)fail('The origin refused or could not be reached: check the token, the audience and the certificate')};
+  ws.onclose=()=>{clearInterval(heartbeat);$('stop').disabled=true;if(!$('status').classList.contains('error'))setStatus('Disconnected')};
+}
+
+function closeSocket(){
+  clearInterval(heartbeat);
+  if(ws){if(ws.readyState===1){try{sendFrame('DISCONNECT',{})}catch{}}ws.close();ws=null}
+}
+$('stop').onclick=()=>{closeSocket();setStatus('Disconnected')};
+</script></body></html>
