@@ -348,8 +348,22 @@ func (s *Server) handleConn(conn net.Conn) {
 	ticker := time.NewTicker(readTimeout)
 	defer ticker.Stop()
 
+	// A nil channel blocks forever, so a Principal without an Expiry never
+	// triggers the expiry case below.
+	var expired <-chan time.Time
+	if !sess.principal.Expiry.IsZero() {
+		timer := time.NewTimer(time.Until(sess.principal.Expiry))
+		defer timer.Stop()
+		expired = timer.C
+	}
+
 	for {
 		select {
+		case <-expired:
+			s.log.Info("closing connection: principal expired", "principal", sess.principal.Name)
+			s.send(sess, NewFrame("ERROR", map[string]string{"message": "credentials expired"}, "credentials expired"))
+			return
+
 		case <-ticker.C:
 			if err := s.sendBytes(sess, []byte("\n")); err != nil {
 				return

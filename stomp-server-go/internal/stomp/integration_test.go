@@ -842,3 +842,41 @@ func TestIntegration_ValidateSubscribeCanAuthorizePerPrincipal(t *testing.T) {
 		t.Fatal("timed out waiting for the ERROR frame")
 	}
 }
+
+func TestIntegration_ConnectionClosedWhenPrincipalExpires(t *testing.T) {
+	expiry := time.Now().Add(300 * time.Millisecond)
+	wsURL, srv := startTestServer(t, fixedAuth{Principal{Name: "alice", Expiry: expiry}})
+	conn := dialStompClient(t, wsURL, nil)
+
+	sub, err := conn.Subscribe("/topic/test", stomp.AckAuto)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	waitConnected(t, srv, "/topic/test")
+
+	select {
+	case msg := <-sub.C:
+		if msg == nil || msg.Err == nil || msg.Err.Error() != "credentials expired" {
+			t.Fatalf("got %+v, want an ERROR frame with message %q", msg, "credentials expired")
+		}
+		if time.Now().Before(expiry) {
+			t.Errorf("connection closed at %v, before expiry %v", time.Now(), expiry)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the expiry ERROR frame")
+	}
+	waitDisconnected(t, srv, "/topic/test")
+}
+
+func TestIntegration_ConnectionStaysOpenBeforePrincipalExpiry(t *testing.T) {
+	wsURL, srv := startTestServer(t, fixedAuth{Principal{Name: "alice", Expiry: time.Now().Add(time.Hour)}})
+	conn := dialStompClient(t, wsURL, nil)
+
+	if _, err := conn.Subscribe("/topic/test", stomp.AckAuto); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if !srv.Connected("/topic/test") {
+		t.Error("connection closed even though the principal has not expired")
+	}
+}

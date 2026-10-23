@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -26,6 +27,11 @@ type Principal struct {
 	// Principal agree on its concrete type. Note that a Principal holding
 	// non-comparable Data (e.g. a map) must not be compared with ==.
 	Data any
+
+	// Expiry, if non-zero, is when the Principal's credentials stop being
+	// valid (e.g. the "exp" claim of a parsed JWT). The server closes the
+	// connection at that instant. The zero value means no expiry.
+	Expiry time.Time
 }
 
 // Anonymous reports whether p carries no authenticated identity.
