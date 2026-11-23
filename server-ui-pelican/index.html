@@ -217,7 +217,19 @@ $('form').addEventListener('submit',async ev=>{
     if(!notifyUrl)throw new Error('The director gave no notify-url: no origin exporting this path advertises the Notify capability');
 
     // 3. Topic (computed before connecting; shown in its own step)
-    const clientId=randomId();
+    let clientId;
+    if(token){
+      let subject;
+      try{
+        const payload=token.split('.')[1].replaceAll('-','+').replaceAll('_','/');
+        const bytes=Uint8Array.from(atob(payload),c=>c.charCodeAt(0));
+        subject=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)).sub;
+      }catch{throw new Error('Access token must be a JWT with a readable subject')}
+      if(typeof subject!=='string'||!subject)throw new Error('Access token must have a non-empty subject');
+      clientId=encodeURIComponent(subject).replace(/[!'()*]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase()).replaceAll('%20','+');
+    }else{
+      clientId=randomId();
+    }
     const protocol=fed.scheme;
     const topic=subscriptionTopic(clientId,depth,protocol,objPath);
     reveal('s3');
