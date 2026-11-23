@@ -1,4 +1,4 @@
-package eventsource
+package sources
 
 import (
 	"bytes"
@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"stomp-server-go/internal/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
 )
 
 // pelicanListTimeout bounds a single poll's invocation of the pelican

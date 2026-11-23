@@ -4,6 +4,7 @@
 package messagequeue
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -13,9 +14,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"stomp-server-go/internal/clientqueue"
-	"stomp-server-go/internal/eventsource"
-	"stomp-server-go/internal/stomp"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/eventsource"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
 const (
@@ -72,6 +73,7 @@ type App struct {
 	cfg      Config
 	newQueue clientqueue.Factory
 	metrics  *appMetrics
+	authz    stomp.Authorizer
 
 	mu           sync.Mutex
 	queues       map[string]clientqueue.Queue // client's `subscription` header value -> queue
@@ -83,11 +85,25 @@ type App struct {
 // New registers itself as a subscriber to srv's SUBSCRIBE and ACK events,
 // starts reading source, and returns the running app. newQueue is called
 // once per distinct client id to create that client's clientqueue.Queue.
-func New(srv stomp.StompServer, log *slog.Logger, source eventsource.EventSource, newQueue clientqueue.Factory) *App {
-	return NewWithConfig(srv, log, source, defaultConfig, newQueue)
+func New(srv stomp.StompServer, log *slog.Logger, source eventsource.EventSource, newQueue clientqueue.Factory, opts ...Option) *App {
+	return NewWithConfig(srv, log, source, defaultConfig, newQueue, opts...)
 }
 
-func NewWithConfig(srv stomp.StompServer, log *slog.Logger, source eventsource.EventSource, cfg Config, newQueue clientqueue.Factory) *App {
+// Option customizes an App at construction.
+type Option func(*App)
+
+// WithAuthorizer sets the policy consulted, per SUBSCRIBE, for whether the
+// authenticated principal may subscribe to the requested destination. The
+// default permits everything (stomp.AllowAll).
+func WithAuthorizer(authz stomp.Authorizer) Option {
+	return func(a *App) {
+		if authz != nil {
+			a.authz = authz
+		}
+	}
+}
+
+func NewWithConfig(srv stomp.StompServer, log *slog.Logger, source eventsource.EventSource, cfg Config, newQueue clientqueue.Factory, opts ...Option) *App {
 	a := &App{
 		srv:          srv,
 		log:          log,
@@ -98,8 +114,13 @@ func NewWithConfig(srv stomp.StompServer, log *slog.Logger, source eventsource.E
 		inFlights:    map[string]*inFlightDelivery{},
 		destinations: map[string]string{},
 		clientIDs:    map[string]string{},
+		authz:        stomp.AllowAll{},
+	}
+	for _, opt := range opts {
+		opt(a)
 	}
 	a.metrics = newAppMetrics(a)
+	srv.ValidateSubscribe(a.validateSubscribe)
 	srv.OnSubscribe(a.onSubscribe)
 	srv.OnUnsubscribe(a.onUnsubscribe)
 	srv.OnAck(a.onAck)
@@ -303,6 +324,34 @@ func subscriptionParams(destination string) string {
 	return ""
 }
 
+// validateSubscribe vets a SUBSCRIBE's headers, logging and counting a
+// rejection. It is registered with the STOMP server so a bad SUBSCRIBE is
+// answered with an ERROR frame and a closed connection before it takes
+// effect; onSubscribe repeats the check so it holds even when driven
+// directly.
+func (a *App) validateSubscribe(p stomp.Principal, headers map[string]string) error {
+	clientID := headers["subscription"]
+	destination := headers["destination"]
+	if clientID == "" || destination == "" {
+		a.log.Warn("SUBSCRIBE missing subscription/destination header; rejecting", "headers", headers)
+		a.metrics.subscribeRejected("missing_headers")
+		return errors.New("SUBSCRIBE requires subscription and destination headers")
+	}
+	if !hasOwningSegment(destination, clientID) {
+		a.log.Warn("SUBSCRIBE destination does not start with the client's own subscription id; rejecting",
+			"subscription", clientID, "destination", destination)
+		a.metrics.subscribeRejected("wrong_owner")
+		return fmt.Errorf("destination %q must start with your own subscription id %q", destination, clientID)
+	}
+	if !a.authz.Authorize(p, destination) {
+		a.log.Warn("SUBSCRIBE not authorized; rejecting",
+			"user", p.Name, "subscription", clientID, "destination", destination)
+		a.metrics.subscribeRejected("unauthorized")
+		return fmt.Errorf("not authorized to subscribe to %q", destination)
+	}
+	return nil
+}
+
 // onSubscribe creates a new event queue the first time a client's
 // `subscription` header is seen, or resumes the existing one if it matches a
 // queue kept around from an earlier connection made with the same
@@ -324,20 +373,12 @@ func subscriptionParams(destination string) string {
 // after that is this client's subscription parameters (see
 // subscriptionParams), so one client can never subscribe to a destination
 // namespaced under a different client's id.
-func (a *App) onSubscribe(headers map[string]string) {
+func (a *App) onSubscribe(p stomp.Principal, headers map[string]string) {
+	if a.validateSubscribe(p, headers) != nil {
+		return
+	}
 	clientID := headers["subscription"]
 	destination := headers["destination"]
-	if clientID == "" || destination == "" {
-		a.log.Warn("SUBSCRIBE missing subscription/destination header; ignoring", "headers", headers)
-		a.metrics.subscribeRejected("missing_headers")
-		return
-	}
-	if !hasOwningSegment(destination, clientID) {
-		a.log.Warn("SUBSCRIBE destination does not start with the client's own subscription id; ignoring",
-			"subscription", clientID, "destination", destination)
-		a.metrics.subscribeRejected("wrong_owner")
-		return
-	}
 	if ack := headers["ack"]; ack != "client-individual" {
 		a.log.Warn("client subscribed without ack:client-individual; retries won't work correctly",
 			"subscription", clientID, "ack", ack)
@@ -489,7 +530,7 @@ func (a *App) onRetryTimeout(clientID string, inFlight *inFlightDelivery) {
 // advances the queue. Acks that don't match the currently in-flight message
 // -- because it was already superseded by a retry, a fresh resubscribe, or
 // this is a duplicate/stale ack for an unrelated destination -- are ignored.
-func (a *App) onAck(headers map[string]string) {
+func (a *App) onAck(_ stomp.Principal, headers map[string]string) {
 	messageID := headers["message-id"]
 
 	a.mu.Lock()
@@ -547,7 +588,7 @@ func (a *App) onAck(headers map[string]string) {
 //
 // A destination this app never accepted a subscribe for is silently ignored,
 // the same as onAck/onDisconnect already do.
-func (a *App) onUnsubscribe(headers map[string]string) {
+func (a *App) onUnsubscribe(_ stomp.Principal, headers map[string]string) {
 	destination := headers["destination"]
 
 	a.mu.Lock()
@@ -579,7 +620,7 @@ func (a *App) onUnsubscribe(headers map[string]string) {
 // need only remove the entry. A destination this app never accepted a
 // subscribe for (e.g. one onSubscribe rejected) is a no-op, the same as
 // onAck already does for acks it doesn't recognize.
-func (a *App) onDisconnect(headers map[string]string) {
+func (a *App) onDisconnect(_ stomp.Principal, headers map[string]string) {
 	a.mu.Lock()
 	delete(a.clientIDs, headers["destination"])
 	a.mu.Unlock()

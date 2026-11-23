@@ -1,4 +1,4 @@
-package eventsource
+package sources
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"stomp-server-go/internal/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
 )
 
 // fakePelicanLister is a pelicanListingRunner test double: for each

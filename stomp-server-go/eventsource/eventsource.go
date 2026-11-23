@@ -1,14 +1,9 @@
-// Package eventsource provides messagequeue's EventSource abstraction and
-// its implementations: a plain demo ticker, a restart-durable sequence
-// counter, and a Pelican federation directory watcher.
+// Package eventsource defines the EventSource interface that feeds events
+// into a notification server, plus DefaultNotifier for implementations that
+// don't need per-client filtering.
 package eventsource
 
-import (
-	"fmt"
-	"time"
-
-	"stomp-server-go/internal/clientqueue"
-)
+import "github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
 
 // EventSource produces events that get fanned out to every registered
 // client queue ShouldNotify accepts.
@@ -45,40 +40,13 @@ type EventSource interface {
 	QueueRemoved(q clientqueue.Queue)
 }
 
-// defaultNotifier is embedded by EventSource implementations that don't need
+// DefaultNotifier is embedded by EventSource implementations that don't need
 // per-client filtering or queue tracking: ShouldNotify always says yes,
 // matching the original fan-out-to-every-client behavior, and
 // QueueAdded/QueueRemoved are no-ops. Embed it to get all three for free;
 // define your own method(s) to override just the ones you need.
-type defaultNotifier struct{}
+type DefaultNotifier struct{}
 
-func (defaultNotifier) ShouldNotify(event string, q clientqueue.Queue) bool { return true }
-func (defaultNotifier) QueueAdded(q clientqueue.Queue)                      {}
-func (defaultNotifier) QueueRemoved(q clientqueue.Queue)                    {}
-
-// TickerSource is a demo EventSource that emits an incrementing "Event <n>"
-// string on a fixed interval.
-type TickerSource struct {
-	defaultNotifier
-	ch chan string
-}
-
-// NewTickerSource starts emitting immediately on a background goroutine that
-// runs for the life of the process.
-func NewTickerSource(interval time.Duration) *TickerSource {
-	s := &TickerSource{ch: make(chan string, 1)}
-	go s.run(interval)
-	return s
-}
-
-func (s *TickerSource) Events() <-chan string { return s.ch }
-
-func (s *TickerSource) run(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	n := 0
-	for range ticker.C {
-		n++
-		s.ch <- fmt.Sprintf("Event %d", n)
-	}
-}
+func (DefaultNotifier) ShouldNotify(event string, q clientqueue.Queue) bool { return true }
+func (DefaultNotifier) QueueAdded(q clientqueue.Queue)                      {}
+func (DefaultNotifier) QueueRemoved(q clientqueue.Queue)                    {}

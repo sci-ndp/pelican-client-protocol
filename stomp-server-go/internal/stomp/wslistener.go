@@ -48,8 +48,10 @@ func (l *wsListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	conn := newWSConn(ws)
+	conn.principal = PrincipalFromContext(r.Context())
 	select {
-	case l.connCh <- newWSConn(ws):
+	case l.connCh <- conn:
 	case <-l.closeCh:
 		ws.Close()
 	}

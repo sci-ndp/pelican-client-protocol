@@ -10,9 +10,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"stomp-server-go/internal/clientqueue"
-	"stomp-server-go/internal/eventsource"
-	"stomp-server-go/internal/stomp"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/clientqueue"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/sources"
+	"github.com/sci-ndp/pelican-client-protocol/stomp-server-go/internal/stomp"
 )
 
 // parseHeader does a minimal extraction of one header's value from a raw
@@ -46,7 +46,7 @@ func TestSmokeEndToEnd(t *testing.T) {
 	go srv.Serve(listener)
 	defer listener.Close()
 
-	source := eventsource.NewTickerSource(100 * time.Millisecond)
+	source := sources.NewTickerSource(100 * time.Millisecond)
 	New(srv, discardLogger(), source, clientqueue.NewMemoryQueue)
 
 	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")

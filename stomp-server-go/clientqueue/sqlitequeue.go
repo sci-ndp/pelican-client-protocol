@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/glebarez/go-sqlite"
 )
 
 // OpenDB opens (creating if necessary) the SQLite database at path used to
